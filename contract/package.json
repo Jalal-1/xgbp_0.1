@@ -1,0 +1,19 @@
+{
+  "name": "@mgbp/mgbp-contract",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "compact": "compact compile +0.31.0 src/compact/examples/MGBP.compact src/managed/mgbp",
+    "build": "rm -rf dist && tsc --project tsconfig.build.json && cp -Rf src/managed dist/managed",
+    "typecheck": "tsc --project tsconfig.json --noEmit"
+  }
+}
