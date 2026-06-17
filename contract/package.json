@@ -12,7 +12,7 @@
     }
   },
   "scripts": {
-    "compact": "compact compile +0.31.0 src/compact/examples/MGBP.compact src/managed/mgbp",
+    "compact": "rm -rf src/managed && compact-compiler +0.31.0 --src src/compact --dir examples --out src/managed",
     "build": "rm -rf dist && tsc --project tsconfig.build.json && cp -Rf src/managed dist/managed",
     "typecheck": "tsc --project tsconfig.json --noEmit"
   }

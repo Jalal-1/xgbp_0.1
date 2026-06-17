@@ -19,6 +19,7 @@
     "typecheck": "npm -w @mgbp/mgbp-contract run typecheck && npm -w @mgbp/mgbp-cli run typecheck"
   },
   "devDependencies": {
+    "@openzeppelin/compact-cli": "^0.0.2",
     "@types/node": "^25.9.3",
     "typescript": "^5.9.3"
   }

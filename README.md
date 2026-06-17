@@ -17,7 +17,13 @@ contract/src/compact/examples/MGBP.compact
 The app-local Compact compiler output is generated under:
 
 ```text
-contract/src/managed/mgbp
+contract/src/managed/MGBP
+```
+
+Contract compilation uses OpenZeppelin Compact Tools:
+
+```bash
+npm run compact
 ```
 
 No local `.compact` wrapper is used.

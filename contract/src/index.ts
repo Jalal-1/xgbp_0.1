@@ -1,1 +1,1 @@
-export * as MGBP from './managed/mgbp/contract/index.js';
+export * as MGBP from './managed/MGBP/contract/index.js';
