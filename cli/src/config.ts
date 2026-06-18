@@ -1,3 +1,5 @@
+import { setNetworkId } from '@midnight-ntwrk/midnight-js-network-id';
+
 export type NetworkName = 'local' | 'preview' | 'preprod';
 
 export type NetworkConfig = {
@@ -36,3 +38,10 @@ export const networks: Record<NetworkName, NetworkConfig> = {
   },
 };
 
+export const selectNetwork = (name: NetworkName): NetworkConfig => {
+  const network = networks[name];
+  setNetworkId(network.networkId);
+  return network;
+};
+
+export const isNetworkName = (value: string): value is NetworkName => value in networks;

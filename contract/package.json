@@ -1,5 +1,5 @@
 {
-  "name": "@mgbp/mgbp-contract",
+  "name": "@xgbp/xgbp-contract",
   "version": "0.1.0",
   "private": true,
   "type": "module",
@@ -12,8 +12,11 @@
     }
   },
   "scripts": {
-    "compact": "rm -rf src/managed && compact-compiler +0.31.0 --src src/compact --dir examples --out src/managed",
-    "build": "rm -rf dist && tsc --project tsconfig.build.json && cp -Rf src/managed dist/managed",
+    "compact": "rm -rf src/artifacts && compact-compiler +0.31.0 --src src --dir compact/examples --out src/artifacts",
+    "build": "compact-builder +0.31.0 --clean-dist --src src --dir compact/examples --out src/artifacts",
     "typecheck": "tsc --project tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@midnight-ntwrk/compact-runtime": "^0.16.0"
   }
 }

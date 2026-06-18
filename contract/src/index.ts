@@ -1,1 +1,2 @@
-export * as MGBP from './managed/MGBP/contract/index.js';
+export * as XGBP from './artifacts/XGBP/contract/index.js';
+export * from './state.js';

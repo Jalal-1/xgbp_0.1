@@ -1,5 +1,5 @@
 {
-  "name": "mgbp_0.1",
+  "name": "xgbp_0.1",
   "version": "0.1.0",
   "private": true,
   "type": "module",
@@ -8,19 +8,23 @@
     "cli"
   ],
   "scripts": {
-    "compact": "npm -w @mgbp/mgbp-contract run compact",
-    "build:contract": "npm -w @mgbp/mgbp-contract run build",
-    "build:cli": "npm -w @mgbp/mgbp-cli run build",
+    "compact": "npm -w @xgbp/xgbp-contract run compact",
+    "build:contract": "npm -w @xgbp/xgbp-contract run build",
+    "build:cli": "npm -w @xgbp/xgbp-cli run build",
     "build": "npm run build:contract && npm run build:cli",
-    "cli": "npm run build:cli && npm -w @mgbp/mgbp-cli run start --",
+    "cli": "npm -w @xgbp/xgbp-cli run start --",
+    "tui": "npm run cli -- tui",
+    "deploy": "npm run cli -- deploy",
+    "deploy:fresh": "npm run build && npm run deploy --",
     "network:up": "npm run cli -- network up",
     "network:down": "npm run cli -- network down",
     "network:status": "npm run cli -- network status",
-    "typecheck": "npm -w @mgbp/mgbp-contract run typecheck && npm -w @mgbp/mgbp-cli run typecheck"
+    "typecheck": "npm -w @xgbp/xgbp-contract run typecheck && npm -w @xgbp/xgbp-cli run typecheck"
   },
   "devDependencies": {
     "@openzeppelin/compact-cli": "^0.0.2",
     "@types/node": "^25.9.3",
+    "@types/ws": "^8.18.1",
     "typescript": "^5.9.3"
   }
 }

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// OpenZeppelin Compact Contracts v0.2.0 (examples/MGBP.compact)
+// OpenZeppelin Compact Contracts v0.2.0 (examples/XGBP.compact)
 
 pragma language_version >= 0.23.0;
 
