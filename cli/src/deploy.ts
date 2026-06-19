@@ -27,7 +27,7 @@ export type DeployOptions = {
   symbol: string;
   decimals: bigint;
   verifierKeyChunkSize: number;
-  onProgress?: (message: string) => void | Promise<void>;
+  onProgress?: (message: string, tx?: FinalizedTxData) => void | Promise<void>;
 };
 
 const witnesses = createXgbpWitnesses();
@@ -42,9 +42,9 @@ const circuitIds = Object.keys(new XGBP.Contract<XgbpPrivateState>(witnesses).pr
 const projectRoot = path.resolve(new URL(import.meta.url).pathname, '..', '..', '..');
 const ttl = (): Date => new Date(Date.now() + 30 * 60 * 1000);
 
-const report = async (options: DeployOptions, message: string): Promise<void> => {
+const report = async (options: DeployOptions, message: string, tx?: FinalizedTxData): Promise<void> => {
   if (options.onProgress !== undefined) {
-    await options.onProgress(message);
+    await options.onProgress(message, tx);
     return;
   }
 
@@ -148,7 +148,7 @@ const deployWithoutVerifierKeys = async (
   await providers.privateStateProvider.set(XgbpPrivateStateId, initResult.private.privateState);
   await providers.privateStateProvider.setSigningKey(contractAddress, initResult.private.signingKey);
 
-  await report(options, `Stripped deploy finalized: ${contractAddress}`);
+  await report(options, `Stripped deploy finalized: ${contractAddress}`, txData);
   return contractAddress;
 };
 
@@ -200,6 +200,7 @@ const submitVerifierKeyChunk = async (
   if (finalized.status !== SucceedEntirely) {
     throw new Error(`Verifier-key chunk failed with status ${finalized.status}`);
   }
+  await report(options, `Verifier-key maintenance finalized: block ${finalized.blockHeight}`, finalized);
   return finalized;
 };
 

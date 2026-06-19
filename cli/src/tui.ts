@@ -1,5 +1,5 @@
 import { stdin as input, stdout as output } from 'node:process';
-import * as readline from 'node:readline/promises';
+import { emitKeypressEvents } from 'node:readline';
 import { actorNames, shortHex, type ActorName } from '@xgbp/xgbp-contract';
 import { deployXgbp } from './deploy.js';
 import * as xgbp from './xgbp-api.js';
@@ -9,10 +9,47 @@ import type { DeployedXgbpContract, XgbpProviders } from './types.js';
 import { buildWallet, type WalletContext } from './wallet.js';
 
 type ActivityLevel = 'info' | 'pending' | 'success' | 'error';
+type ActivitySource = 'ONCHAIN' | 'LOCAL' | 'SYSTEM';
 
 type ActivityMessage = {
   level: ActivityLevel;
+  source: ActivitySource;
   text: string;
+};
+
+type PromptState = {
+  label: string;
+  buffer: string;
+  resolve: (value: string) => void;
+};
+
+type Keypress = {
+  name?: string;
+  ctrl?: boolean;
+  meta?: boolean;
+};
+
+type ChecklistStatus = 'pending' | 'active' | 'done' | 'blocked' | 'failed';
+type GuidedStepId =
+  | 'deploy'
+  | 'actors'
+  | 'kycRequired'
+  | 'approveAlice'
+  | 'approveBob'
+  | 'registerAlice'
+  | 'registerBob'
+  | 'mintAlice'
+  | 'transferInitial'
+  | 'freezeBob'
+  | 'blockedTransfer'
+  | 'unfreezeBob'
+  | 'transferAfterUnfreeze'
+  | 'burnBob';
+
+type ChecklistItem = {
+  id: GuidedStepId;
+  label: string;
+  status: ChecklistStatus;
 };
 
 type TokenMetadata = {
@@ -31,7 +68,6 @@ type TuiSession = {
 type TuiState = {
   networkName: NetworkName;
   network: NetworkConfig;
-  rl: readline.Interface;
   session?: TuiSession;
   snapshot?: xgbp.ContractSnapshot;
   changedKeys: Set<string>;
@@ -39,13 +75,33 @@ type TuiState = {
   spinnerFrame: number;
   liveStatus?: ActivityMessage;
   activity: ActivityMessage[];
+  logScrollOffset: number;
+  checklist: ChecklistItem[];
+  prompt?: PromptState;
 };
 
 const minWidth = 120;
-const minHeight = 35;
-const activityLimit = 3;
+const minHeight = 38;
+const activityLimit = 200;
+const visibleActivityLimit = 7;
 const spinnerFrames = ['-', '\\', '|', '/'];
 const registryActors: ActorName[] = ['alice', 'bob'];
+const guidedChecklistTemplate: ReadonlyArray<Omit<ChecklistItem, 'status'>> = [
+  { id: 'deploy', label: 'Deploy contract' },
+  { id: 'actors', label: 'Set up actors' },
+  { id: 'kycRequired', label: 'Set KYC required' },
+  { id: 'approveAlice', label: 'Approve Alice KYC' },
+  { id: 'approveBob', label: 'Approve Bob KYC' },
+  { id: 'registerAlice', label: 'Register Alice' },
+  { id: 'registerBob', label: 'Register Bob' },
+  { id: 'mintAlice', label: 'Mint Alice 1000' },
+  { id: 'transferInitial', label: 'Alice pays Bob 125' },
+  { id: 'freezeBob', label: 'Freeze Bob' },
+  { id: 'blockedTransfer', label: 'Block frozen transfer' },
+  { id: 'unfreezeBob', label: 'Unfreeze Bob' },
+  { id: 'transferAfterUnfreeze', label: 'Alice pays Bob 10' },
+  { id: 'burnBob', label: 'Bob burns 25' },
+];
 
 const ansi = {
   clear: '\x1b[2J\x1b[H',
@@ -74,6 +130,20 @@ const levelColor: Record<ActivityLevel, string> = {
   pending: ansi.blue,
   success: ansi.green,
   error: ansi.red,
+};
+
+const sourceColor: Record<ActivitySource, string> = {
+  ONCHAIN: ansi.cyan,
+  LOCAL: ansi.magenta,
+  SYSTEM: ansi.gray,
+};
+
+const checklistColor: Record<ChecklistStatus, string> = {
+  pending: ansi.gray,
+  active: ansi.blue,
+  done: ansi.green,
+  blocked: ansi.yellow,
+  failed: ansi.red,
 };
 
 const paint = (value: string, color: string): string => `${color}${value}${ansi.reset}`;
@@ -157,6 +227,30 @@ const boolView = (state: TuiState, id: string, value: boolean): string => {
 
 const encrypted = (): string => paint('encrypted', ansi.gray);
 
+const createChecklist = (): ChecklistItem[] =>
+  guidedChecklistTemplate.map((item) => ({
+    ...item,
+    status: 'pending',
+  }));
+
+const setChecklistStatus = (state: TuiState, id: GuidedStepId, status: ChecklistStatus): void => {
+  state.checklist = state.checklist.map((item) => (item.id === id ? { ...item, status } : item));
+};
+
+const resetGuidedChecklist = (state: TuiState): void => {
+  state.checklist = createChecklist();
+  if (state.session !== undefined) {
+    setChecklistStatus(state, 'deploy', 'done');
+    setChecklistStatus(state, 'actors', 'done');
+  }
+};
+
+const scrollLogs = (state: TuiState, delta: number): void => {
+  const maxOffset = Math.max(0, state.activity.length - (visibleActivityLimit - 1));
+  state.logScrollOffset = Math.max(0, Math.min(maxOffset, state.logScrollOffset + delta));
+  render(state);
+};
+
 const flattenSnapshot = (snapshot: xgbp.ContractSnapshot): Record<string, string> => {
   const flat: Record<string, string> = {
     kycRequired: String(snapshot.kycRequired),
@@ -193,12 +287,18 @@ const rememberSnapshot = async (state: TuiState): Promise<void> => {
   state.changedKeys = changed;
 };
 
-const pushActivity = (state: TuiState, level: ActivityLevel, text: string): void => {
-  state.activity = [...state.activity, { level, text }].slice(-activityLimit);
+const pushActivity = (state: TuiState, level: ActivityLevel, source: ActivitySource, text: string): void => {
+  const wasViewingOlderLogs = state.logScrollOffset > 0;
+  state.activity = [...state.activity, { level, source, text }].slice(-activityLimit);
+
+  if (wasViewingOlderLogs) {
+    const maxOffset = Math.max(0, state.activity.length - (visibleActivityLimit - 1));
+    state.logScrollOffset = Math.min(maxOffset, state.logScrollOffset + 1);
+  }
 };
 
-const setLiveStatus = (state: TuiState, level: ActivityLevel, text: string): void => {
-  state.liveStatus = { level, text };
+const setLiveStatus = (state: TuiState, level: ActivityLevel, source: ActivitySource, text: string): void => {
+  state.liveStatus = { level, source, text };
 };
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
@@ -217,9 +317,14 @@ const animateWhile = async <T>(state: TuiState, operation: Promise<T>): Promise<
   }
 };
 
-const runPending = async <T>(state: TuiState, message: string, operation: () => Promise<T>): Promise<T> => {
-  setLiveStatus(state, 'pending', message);
-  pushActivity(state, 'pending', message);
+const runPending = async <T>(
+  state: TuiState,
+  source: ActivitySource,
+  message: string,
+  operation: () => Promise<T>,
+): Promise<T> => {
+  setLiveStatus(state, 'pending', source, message);
+  pushActivity(state, 'pending', source, message);
   render(state);
   return await animateWhile(state, operation());
 };
@@ -269,6 +374,9 @@ const renderSmallScreen = (state: TuiState, width: number, height: number): stri
           '6 Burn',
           '7 Refresh',
           '8 Exit',
+          '[ Older logs',
+          '] Newer logs',
+          '0 Latest logs',
         ];
 
   return [
@@ -358,19 +466,117 @@ const renderRegistryBox = (state: TuiState): string[] => {
   return formatBox('KYC / Freeze Registry', lines, 58, 10, ansi.green);
 };
 
+const checklistMarker = (status: ChecklistStatus): string => {
+  switch (status) {
+    case 'pending':
+      return '[ ]';
+    case 'active':
+      return '[>]';
+    case 'done':
+      return '[x]';
+    case 'blocked':
+      return '[!]';
+    case 'failed':
+      return '[!]';
+  }
+};
+
+const renderChecklistItem = (item: ChecklistItem, width: number): string => {
+  const text = `${checklistMarker(item.status)} ${item.label}`;
+  return padVisible(truncate(paint(text, checklistColor[item.status]), width), width);
+};
+
+const renderChecklistBox = (state: TuiState): string[] => {
+  const columnWidth = 23;
+  const rows: string[] = [];
+  const midpoint = Math.ceil(state.checklist.length / 2);
+
+  for (let index = 0; index < midpoint; index += 1) {
+    const left = state.checklist[index];
+    const right = state.checklist[index + midpoint];
+    rows.push(
+      `${left === undefined ? ' '.repeat(columnWidth) : renderChecklistItem(left, columnWidth)}  ${
+        right === undefined ? '' : renderChecklistItem(right, columnWidth)
+      }`,
+    );
+  }
+
+  return formatBox('Guided Flow', rows, 50, 11, ansi.yellow);
+};
+
+const shortRef = (value: string): string => {
+  if (value.length <= 22) return value;
+  return `${value.slice(0, 10)}...${value.slice(-8)}`;
+};
+
+const formatTxReference = (reference: xgbp.TxReference): string =>
+  `${reference.operation}: txId=${shortRef(reference.txId)} txHash=${shortRef(reference.txHash)} block=${
+    reference.blockHeight
+  } status=${reference.status}`;
+
+const recordOperationResult = (state: TuiState, result: xgbp.OperationResult): void => {
+  for (const message of result.local) {
+    pushActivity(state, 'success', 'LOCAL', message);
+  }
+
+  for (const reference of result.onchain) {
+    pushActivity(state, 'success', 'ONCHAIN', formatTxReference(reference));
+  }
+};
+
+const deployProgressSource = (message: string, hasTx: boolean): ActivitySource => {
+  if (hasTx) return 'ONCHAIN';
+  if (/(submitting|waiting|finalized|publishing|maintenance)/i.test(message)) return 'ONCHAIN';
+  if (/(wallet|private|local|provider|artifact|saving|binding|constructor|loading|signing|balancing|preparing|reading)/i.test(message)) {
+    return 'LOCAL';
+  }
+  return 'SYSTEM';
+};
+
 const renderActivity = (state: TuiState): string[] => {
+  const logView =
+    state.logScrollOffset === 0
+      ? paint('View: latest   keys: [ older  ] newer  0 latest', ansi.gray)
+      : paint(`View: ${state.logScrollOffset} line(s) older   keys: [ older  ] newer  0 latest`, ansi.gray);
+
+  if (state.logScrollOffset > 0) {
+    const end = Math.max(0, state.activity.length - state.logScrollOffset);
+    const start = Math.max(0, end - (visibleActivityLimit - 1));
+    const messages = state.activity.slice(start, end);
+    return [
+      logView,
+      ...messages.map(
+        (message) =>
+          `${paint(message.level.toUpperCase().padEnd(7), levelColor[message.level])} ${paint(
+            `[${message.source}]`,
+            sourceColor[message.source],
+          )} ${message.text}`,
+      ),
+    ];
+  }
+
   const history =
     state.liveStatus === undefined
       ? state.activity
-      : state.activity.filter((message) => message.level !== state.liveStatus?.level || message.text !== state.liveStatus.text);
-  const messages = state.liveStatus === undefined ? history : [state.liveStatus, ...history];
-  if (messages.length === 0) return [paint('No activity yet.', ansi.gray)];
+      : state.activity.filter(
+          (message) =>
+            message.level !== state.liveStatus?.level ||
+            message.source !== state.liveStatus.source ||
+            message.text !== state.liveStatus.text,
+        );
+  const historyLimit = state.liveStatus === undefined ? visibleActivityLimit - 1 : visibleActivityLimit - 2;
+  const visibleHistory = history.slice(-historyLimit);
+  const messages = state.liveStatus === undefined ? visibleHistory : [state.liveStatus, ...visibleHistory];
+  if (messages.length === 0) return [logView, paint('No activity yet.', ansi.gray)];
 
-  return messages.map((message, index) => {
-    const isLivePending = index === 0 && state.liveStatus?.level === 'pending';
-    const label = isLivePending ? `${spinnerFrames[state.spinnerFrame]} WAIT` : message.level.toUpperCase().padEnd(7);
-    return `${paint(label, levelColor[message.level])} ${message.text}`;
-  });
+  return [
+    logView,
+    ...messages.map((message, index) => {
+      const isLivePending = index === 0 && state.liveStatus?.level === 'pending';
+      const label = isLivePending ? `${spinnerFrames[state.spinnerFrame]} WAIT` : message.level.toUpperCase().padEnd(7);
+      return `${paint(label, levelColor[message.level])} ${paint(`[${message.source}]`, sourceColor[message.source])} ${message.text}`;
+    }),
+  ];
 };
 
 const renderDashboard = (state: TuiState): string[] => {
@@ -387,13 +593,22 @@ const renderDashboard = (state: TuiState): string[] => {
     '',
     ...joinColumns([renderPublicBox(state), renderRegistryBox(state)]),
     '',
-    ...formatBox('Information / Activity', renderActivity(state), 118, 8, ansi.blue),
+    ...joinColumns([renderChecklistBox(state), formatBox('Logs', renderActivity(state), 66, 11, ansi.blue)]),
     '+--------------------------------------------------------------------------------------------------------------------+',
-    `| ${paint('1', ansi.cyan)} Guided flow   ${paint('2', ansi.cyan)} KYC/register   ${paint('3', ansi.cyan)} Mint   ${paint(
-      '4',
-      ansi.cyan,
-    )} Transfer   ${paint('5', ansi.cyan)} Freeze/unfreeze                         |`,
-    `| ${paint('6', ansi.cyan)} Burn   ${paint('7', ansi.cyan)} Refresh   ${paint('8', ansi.cyan)} Exit                                                        |`,
+    `|${padVisible(
+      ` ${paint('1', ansi.cyan)} Guided flow   ${paint('2', ansi.cyan)} KYC/register   ${paint('3', ansi.cyan)} Mint   ${paint(
+        '4',
+        ansi.cyan,
+      )} Transfer   ${paint('5', ansi.cyan)} Freeze/unfreeze`,
+      116,
+    )}|`,
+    `|${padVisible(
+      ` ${paint('6', ansi.cyan)} Burn   ${paint('7', ansi.cyan)} Refresh   ${paint('8', ansi.cyan)} Exit   ${paint(
+        '[',
+        ansi.cyan,
+      )} Older logs   ${paint(']', ansi.cyan)} Newer logs   ${paint('0', ansi.cyan)} Latest logs`,
+      116,
+    )}|`,
     '+--------------------------------------------------------------------------------------------------------------------+',
   ];
 };
@@ -401,20 +616,28 @@ const renderDashboard = (state: TuiState): string[] => {
 const render = (state: TuiState): void => {
   const width = output.columns ?? 80;
   const height = output.rows ?? 24;
+  const prompt =
+    state.prompt === undefined ? '' : `\n${paint('> ', ansi.cyan)}${state.prompt.label}${state.prompt.buffer}`;
 
   if (width < minWidth || height < minHeight) {
-    output.write(`${ansi.clear}${renderSmallScreen(state, width, height).join('\n')}\n`);
+    output.write(`${ansi.clear}${renderSmallScreen(state, width, height).join('\n')}${prompt}`);
     return;
   }
 
   // Full-frame ANSI redraw keeps provider/prover progress inside the fixed UI.
   const lines = state.session === undefined ? renderStartup(state) : renderDashboard(state);
-  output.write(`${ansi.clear}${lines.join('\n')}\n`);
+  output.write(`${ansi.clear}${lines.join('\n')}${prompt}`);
 };
 
 const ask = async (state: TuiState, prompt: string): Promise<string> => {
-  render(state);
-  return (await state.rl.question(`${paint('> ', ansi.cyan)}${prompt}`)).trim();
+  return await new Promise((resolve) => {
+    state.prompt = {
+      label: prompt,
+      buffer: '',
+      resolve: (value) => resolve(value.trim()),
+    };
+    render(state);
+  });
 };
 
 const parseHolder = (value: string): ActorName | undefined => {
@@ -433,25 +656,120 @@ const askAmount = async (state: TuiState): Promise<bigint | undefined> => {
   return amount > 0n ? amount : undefined;
 };
 
+const finishPrompt = (state: TuiState, value: string): void => {
+  const prompt = state.prompt;
+  if (prompt === undefined) return;
+
+  state.prompt = undefined;
+  prompt.resolve(value);
+};
+
+const handleKeypress = (state: TuiState, value: string, key: Keypress): void => {
+  if (key.ctrl === true && key.name === 'c') {
+    finishPrompt(state, '8');
+    return;
+  }
+
+  if (value === '[' || key.name === 'pageup') {
+    scrollLogs(state, visibleActivityLimit - 1);
+    return;
+  }
+
+  if (value === ']' || key.name === 'pagedown') {
+    scrollLogs(state, -(visibleActivityLimit - 1));
+    return;
+  }
+
+  const isSelectActionPrompt =
+    state.prompt !== undefined && state.prompt.label === 'Select action: ' && state.prompt.buffer.length === 0;
+
+  if ((value === '0' && (state.prompt === undefined || isSelectActionPrompt)) || key.name === 'home') {
+    state.logScrollOffset = 0;
+    render(state);
+    return;
+  }
+
+  const prompt = state.prompt;
+  if (prompt === undefined) return;
+
+  if (key.name === 'return' || key.name === 'enter') {
+    finishPrompt(state, prompt.buffer);
+    return;
+  }
+
+  if (key.name === 'backspace') {
+    prompt.buffer = prompt.buffer.slice(0, -1);
+    render(state);
+    return;
+  }
+
+  if (key.name === 'escape') {
+    prompt.buffer = '';
+    render(state);
+    return;
+  }
+
+  if (key.ctrl === true || key.meta === true || value.length === 0) return;
+
+  const codePoint = value.codePointAt(0);
+  if (codePoint !== undefined && codePoint >= 32 && codePoint !== 127) {
+    prompt.buffer += value;
+    render(state);
+  }
+};
+
 const runStep = async (
   state: TuiState,
   actor: ActorName,
   description: string,
-  operation: () => Promise<void>,
+  operation: () => Promise<xgbp.OperationResult>,
+  checklistStep?: GuidedStepId,
 ): Promise<boolean> => {
   try {
-    await runPending(state, `Acting as ${actorLabel(actor)}: ${description}`, operation);
+    if (checklistStep !== undefined) setChecklistStatus(state, checklistStep, 'active');
+    const result = await runPending(state, 'ONCHAIN', `Acting as ${actorLabel(actor)}: ${description}`, operation);
+    recordOperationResult(state, result);
     await rememberSnapshot(state);
-    setLiveStatus(state, 'success', `Acting as ${actorLabel(actor)}: ${description}`);
-    pushActivity(state, 'success', `Acting as ${actorLabel(actor)}: ${description}`);
+    if (checklistStep !== undefined) setChecklistStatus(state, checklistStep, 'done');
+    setLiveStatus(state, 'success', 'SYSTEM', `Acting as ${actorLabel(actor)}: ${description}`);
+    pushActivity(state, 'success', 'SYSTEM', `Acting as ${actorLabel(actor)}: ${description}`);
     await pulseChangedValues(state);
     return true;
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    setLiveStatus(state, 'error', `Acting as ${actorLabel(actor)}: ${description} failed: ${message}`);
-    pushActivity(state, 'error', `Acting as ${actorLabel(actor)}: ${description} failed: ${message}`);
+    if (checklistStep !== undefined) setChecklistStatus(state, checklistStep, 'failed');
+    setLiveStatus(state, 'error', 'ONCHAIN', `Acting as ${actorLabel(actor)}: ${description} failed: ${message}`);
+    pushActivity(state, 'error', 'ONCHAIN', `Acting as ${actorLabel(actor)}: ${description} failed: ${message}`);
     render(state);
     return false;
+  }
+};
+
+const runExpectedFailureStep = async (
+  state: TuiState,
+  actor: ActorName,
+  description: string,
+  operation: () => Promise<xgbp.OperationResult>,
+  checklistStep: GuidedStepId,
+): Promise<boolean> => {
+  setChecklistStatus(state, checklistStep, 'active');
+
+  try {
+    const result = await runPending(state, 'ONCHAIN', `Acting as ${actorLabel(actor)}: ${description}`, operation);
+    recordOperationResult(state, result);
+    await rememberSnapshot(state);
+    setChecklistStatus(state, checklistStep, 'failed');
+    setLiveStatus(state, 'error', 'SYSTEM', `Expected rejection, but transaction succeeded: ${description}`);
+    pushActivity(state, 'error', 'SYSTEM', `Expected rejection, but transaction succeeded: ${description}`);
+    await pulseChangedValues(state);
+    return false;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    setChecklistStatus(state, checklistStep, 'done');
+    setLiveStatus(state, 'success', 'ONCHAIN', `Rejected as expected: ${description}`);
+    pushActivity(state, 'success', 'ONCHAIN', `Rejected as expected: ${message}`);
+    render(state);
+    return true;
   }
 };
 
@@ -462,7 +780,7 @@ const requireSession = (state: TuiState): TuiSession => {
 
 const deployNew = async (state: TuiState): Promise<void> => {
   if (state.session !== undefined) {
-    pushActivity(state, 'info', 'A contract is already active in this TUI session.');
+    pushActivity(state, 'info', 'SYSTEM', 'A contract is already active in this TUI session.');
     return;
   }
 
@@ -470,24 +788,30 @@ const deployNew = async (state: TuiState): Promise<void> => {
   let walletContext: WalletContext | undefined;
 
   try {
-    walletContext = await runPending(state, 'Starting wallet setup for deployer/issuer...', () =>
+    walletContext = await runPending(state, 'LOCAL', 'Starting wallet setup for deployer/issuer...', () =>
       buildWallet(state.network, undefined, {
         printSeed: state.networkName !== 'local',
         onProgress: (message) => {
-          setLiveStatus(state, 'pending', message);
+          setLiveStatus(state, 'pending', 'LOCAL', message);
+          pushActivity(state, 'pending', 'LOCAL', message);
           render(state);
         },
       }),
     );
-    const providers = await runPending(state, 'Configuring providers: private state, indexer, proof server, ZK artifacts...', () =>
+    const providers = await runPending(state, 'LOCAL', 'Configuring providers: private state, indexer, proof server, ZK artifacts...', () =>
       configureProviders(walletContext as WalletContext, state.network),
     );
-    const contract = await runPending(state, 'Deploying XGBP contract and publishing verifier keys...', () =>
+    const contract = await runPending(state, 'ONCHAIN', 'Deploying XGBP contract and publishing verifier keys...', () =>
       deployXgbp(providers, walletContext as WalletContext, state.networkName, {
         ...token,
         verifierKeyChunkSize: 8,
-        onProgress: (message) => {
-          setLiveStatus(state, 'pending', message);
+        onProgress: (message, tx) => {
+          const source = deployProgressSource(message, tx !== undefined);
+          setLiveStatus(state, 'pending', source, message);
+          pushActivity(state, 'pending', source, message);
+          if (tx !== undefined) {
+            pushActivity(state, 'success', 'ONCHAIN', formatTxReference(xgbp.txReference(message, tx)));
+          }
           render(state);
         },
       }),
@@ -495,34 +819,72 @@ const deployNew = async (state: TuiState): Promise<void> => {
 
     state.session = { walletContext, providers, contract, token };
     await rememberSnapshot(state);
-    setLiveStatus(state, 'success', `XGBP deployed at ${contract.deployTxData.public.contractAddress}`);
-    pushActivity(state, 'success', `XGBP deployed at ${contract.deployTxData.public.contractAddress}`);
+    setChecklistStatus(state, 'deploy', 'done');
+    setChecklistStatus(state, 'actors', 'done');
+    setLiveStatus(state, 'success', 'SYSTEM', `XGBP deployed at ${contract.deployTxData.public.contractAddress}`);
+    pushActivity(state, 'success', 'SYSTEM', `XGBP deployed at ${contract.deployTxData.public.contractAddress}`);
   } catch (error) {
     await walletContext?.wallet.stop();
     const message = error instanceof Error ? error.message : String(error);
-    setLiveStatus(state, 'error', `Deploy failed: ${message}`);
-    pushActivity(state, 'error', `Deploy failed: ${message}`);
+    setLiveStatus(state, 'error', 'ONCHAIN', `Deploy failed: ${message}`);
+    pushActivity(state, 'error', 'ONCHAIN', `Deploy failed: ${message}`);
   }
 };
 
-const kycAndRegisterActors = async (state: TuiState): Promise<void> => {
+const approvalStepFor = (actor: ActorName): GuidedStepId | undefined => {
+  if (actor === 'alice') return 'approveAlice';
+  if (actor === 'bob') return 'approveBob';
+  return undefined;
+};
+
+const registrationStepFor = (actor: ActorName): GuidedStepId | undefined => {
+  if (actor === 'alice') return 'registerAlice';
+  if (actor === 'bob') return 'registerBob';
+  return undefined;
+};
+
+const markDoneIfGuided = (state: TuiState, guided: boolean, step: GuidedStepId | undefined): void => {
+  if (guided && step !== undefined) setChecklistStatus(state, step, 'done');
+};
+
+const kycAndRegisterActors = async (state: TuiState, guided = false): Promise<void> => {
   const session = requireSession(state);
 
-  await runStep(state, 'issuer', 'set KYC required', () => xgbp.setKycRequired(session.providers, session.contract, true));
+  if (state.snapshot?.kycRequired === true) {
+    markDoneIfGuided(state, guided, 'kycRequired');
+  } else {
+    await runStep(
+      state,
+      'issuer',
+      'set KYC required',
+      () => xgbp.setKycRequired(session.providers, session.contract, true),
+      guided ? 'kycRequired' : undefined,
+    );
+  }
 
   for (const actor of registryActors) {
     const status = state.snapshot === undefined ? undefined : actorStatus(state.snapshot, actor);
+    const step = approvalStepFor(actor);
     if (status?.kycApproved !== true) {
-      await runStep(state, 'issuer', `set KYC approved for ${actorLabel(actor)}`, () =>
-        xgbp.setKycApproved(session.providers, session.contract, actor, true),
+      await runStep(
+        state,
+        'issuer',
+        `set KYC approved for ${actorLabel(actor)}`,
+        () => xgbp.setKycApproved(session.providers, session.contract, actor, true),
+        guided ? step : undefined,
       );
+    } else {
+      markDoneIfGuided(state, guided, step);
     }
   }
 
   for (const actor of registryActors) {
     const status = state.snapshot === undefined ? undefined : actorStatus(state.snapshot, actor);
+    const step = registrationStepFor(actor);
     if (status?.registered !== true) {
-      await runStep(state, actor, 'register wallet', () => xgbp.register(session.providers, session.contract, actor));
+      await runStep(state, actor, 'register wallet', () => xgbp.register(session.providers, session.contract, actor), guided ? step : undefined);
+    } else {
+      markDoneIfGuided(state, guided, step);
     }
   }
 };
@@ -530,22 +892,28 @@ const kycAndRegisterActors = async (state: TuiState): Promise<void> => {
 const guidedFlow = async (state: TuiState): Promise<void> => {
   const session = requireSession(state);
 
-  await kycAndRegisterActors(state);
+  resetGuidedChecklist(state);
+  pushActivity(state, 'info', 'SYSTEM', 'Guided flow started.');
+  await kycAndRegisterActors(state, true);
   await runStep(state, 'issuer', 'mint 1000 base units to Alice', () =>
     xgbp.mint(session.providers, session.contract, 'alice', 1000n),
+    'mintAlice',
   );
   await runStep(state, 'alice', 'transfer 125 base units to Bob', () =>
     xgbp.transfer(session.providers, session.contract, 'alice', 'bob', 125n),
+    'transferInitial',
   );
-  await runStep(state, 'issuer', 'freeze Bob', () => xgbp.freeze(session.providers, session.contract, 'bob'));
-  await runStep(state, 'alice', 'attempt transfer 10 base units to frozen Bob', () =>
+  await runStep(state, 'issuer', 'freeze Bob', () => xgbp.freeze(session.providers, session.contract, 'bob'), 'freezeBob');
+  await runExpectedFailureStep(state, 'alice', 'attempt transfer 10 base units to frozen Bob', () =>
     xgbp.transfer(session.providers, session.contract, 'alice', 'bob', 10n),
+    'blockedTransfer',
   );
-  await runStep(state, 'issuer', 'unfreeze Bob', () => xgbp.unfreeze(session.providers, session.contract, 'bob'));
+  await runStep(state, 'issuer', 'unfreeze Bob', () => xgbp.unfreeze(session.providers, session.contract, 'bob'), 'unfreezeBob');
   await runStep(state, 'alice', 'transfer 10 base units to Bob', () =>
     xgbp.transfer(session.providers, session.contract, 'alice', 'bob', 10n),
+    'transferAfterUnfreeze',
   );
-  await runStep(state, 'bob', 'burn 25 base units', () => xgbp.burn(session.providers, session.contract, 'bob', 25n));
+  await runStep(state, 'bob', 'burn 25 base units', () => xgbp.burn(session.providers, session.contract, 'bob', 25n), 'burnBob');
 };
 
 const mint = async (state: TuiState): Promise<void> => {
@@ -554,7 +922,7 @@ const mint = async (state: TuiState): Promise<void> => {
   const amount = await askAmount(state);
 
   if (actor === undefined || amount === undefined) {
-    pushActivity(state, 'error', 'Mint cancelled: invalid actor or amount.');
+    pushActivity(state, 'error', 'SYSTEM', 'Mint cancelled: invalid actor or amount.');
     return;
   }
 
@@ -570,7 +938,7 @@ const transfer = async (state: TuiState): Promise<void> => {
   const amount = await askAmount(state);
 
   if (from === undefined || to === undefined || amount === undefined) {
-    pushActivity(state, 'error', 'Transfer cancelled: invalid actor or amount.');
+    pushActivity(state, 'error', 'SYSTEM', 'Transfer cancelled: invalid actor or amount.');
     return;
   }
 
@@ -585,7 +953,7 @@ const freezeOrUnfreeze = async (state: TuiState): Promise<void> => {
   const mode = (await ask(state, 'Action [f freeze, u unfreeze]: ')).toLowerCase();
 
   if (actor === undefined || (mode !== 'f' && mode !== 'u')) {
-    pushActivity(state, 'error', 'Freeze action cancelled: invalid input.');
+    pushActivity(state, 'error', 'SYSTEM', 'Freeze action cancelled: invalid input.');
     return;
   }
 
@@ -603,7 +971,7 @@ const burn = async (state: TuiState): Promise<void> => {
   const amount = await askAmount(state);
 
   if (actor === undefined || amount === undefined) {
-    pushActivity(state, 'error', 'Burn cancelled: invalid actor or amount.');
+    pushActivity(state, 'error', 'SYSTEM', 'Burn cancelled: invalid actor or amount.');
     return;
   }
 
@@ -614,8 +982,8 @@ const burn = async (state: TuiState): Promise<void> => {
 
 const refresh = async (state: TuiState): Promise<void> => {
   await rememberSnapshot(state);
-  setLiveStatus(state, 'success', 'Refreshed wallet private-state cache for active contract session.');
-  pushActivity(state, 'success', 'Refreshed wallet private-state cache for active contract session.');
+  setLiveStatus(state, 'success', 'LOCAL', 'Refreshed wallet private-state cache for active contract session.');
+  pushActivity(state, 'success', 'LOCAL', 'Refreshed wallet private-state cache for active contract session.');
   await pulseChangedValues(state);
 };
 
@@ -647,26 +1015,44 @@ const dashboardLoop = async (state: TuiState): Promise<void> => {
         break;
       case '8':
         return;
+      case '[':
+      case 'u':
+        scrollLogs(state, visibleActivityLimit - 1);
+        break;
+      case ']':
+      case 'd':
+        scrollLogs(state, -(visibleActivityLimit - 1));
+        break;
+      case '0':
+        state.logScrollOffset = 0;
+        render(state);
+        break;
       default:
-        pushActivity(state, 'error', 'Unknown action.');
+        pushActivity(state, 'error', 'SYSTEM', 'Unknown action.');
         break;
     }
   }
 };
 
 export const runTui = async (networkName: NetworkName, network: NetworkConfig): Promise<void> => {
-  const rl = readline.createInterface({ input, output });
   const state: TuiState = {
     networkName,
     network,
-    rl,
     changedKeys: new Set(),
     flashOn: false,
     spinnerFrame: 0,
     liveStatus: undefined,
     activity: [],
+    logScrollOffset: 0,
+    checklist: createChecklist(),
   };
+  const wasRaw = input.isTTY === true && input.isRaw === true;
+  const onKeypress = (value: string, key: Keypress): void => handleKeypress(state, value, key);
 
+  emitKeypressEvents(input);
+  input.on('keypress', onKeypress);
+  if (input.isTTY === true) input.setRawMode(true);
+  input.resume();
   output.write(ansi.hideCursor);
 
   try {
@@ -683,14 +1069,27 @@ export const runTui = async (networkName: NetworkName, network: NetworkConfig): 
         case '2':
           done = true;
           break;
+        case '[':
+        case 'u':
+          scrollLogs(state, visibleActivityLimit - 1);
+          break;
+        case ']':
+        case 'd':
+          scrollLogs(state, -(visibleActivityLimit - 1));
+          break;
+        case '0':
+          state.logScrollOffset = 0;
+          render(state);
+          break;
         default:
-          pushActivity(state, 'error', 'Unknown action.');
+          pushActivity(state, 'error', 'SYSTEM', 'Unknown action.');
           break;
       }
     }
   } finally {
+    input.off('keypress', onKeypress);
+    if (input.isTTY === true) input.setRawMode(wasRaw);
     await state.session?.walletContext.wallet.stop();
-    rl.close();
     output.write(ansi.showCursor);
   }
 };

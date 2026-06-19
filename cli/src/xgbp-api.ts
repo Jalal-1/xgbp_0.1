@@ -14,6 +14,7 @@ import {
   type ActorName,
   type XgbpPrivateState,
 } from '@xgbp/xgbp-contract';
+import type { FinalizedTxData } from '@midnight-ntwrk/midnight-js-types';
 import { XgbpPrivateStateId, type DeployedXgbpContract, type XgbpProviders } from './types.js';
 
 export type ActorStatus = {
@@ -30,6 +31,52 @@ export type ContractSnapshot = {
   totalSupply: bigint;
   actors: ActorStatus[];
 };
+
+export type TxReference = {
+  operation: string;
+  txId: string;
+  txHash: string;
+  blockHash: string;
+  blockHeight: number;
+  status: string;
+};
+
+export type OperationResult = {
+  onchain: TxReference[];
+  local: string[];
+};
+
+type RefreshResult = {
+  state: XgbpPrivateState;
+  result: OperationResult;
+};
+
+export const txReference = (operation: string, tx: FinalizedTxData): TxReference => ({
+  operation,
+  txId: String(tx.txId),
+  txHash: String(tx.txHash),
+  blockHash: String(tx.blockHash),
+  blockHeight: tx.blockHeight,
+  status: tx.status,
+});
+
+const actorLabel = (actor: ActorName): string => {
+  switch (actor) {
+    case 'issuer':
+      return 'Issuer';
+    case 'alice':
+      return 'Alice';
+    case 'bob':
+      return 'Bob';
+  }
+};
+
+const local = (...messages: string[]): OperationResult => ({ onchain: [], local: messages });
+
+const mergeResults = (...results: OperationResult[]): OperationResult => ({
+  onchain: results.flatMap((result) => result.onchain),
+  local: results.flatMap((result) => result.local),
+});
 
 const getPrivateState = async (providers: XgbpProviders): Promise<XgbpPrivateState> => {
   const existing = await providers.privateStateProvider.get(XgbpPrivateStateId);
@@ -48,9 +95,19 @@ const activateActor = async (providers: XgbpProviders, actor: ActorName): Promis
   return state;
 };
 
-const readBalanceCiphertext = async (contract: DeployedXgbpContract, accountId: Uint8Array) => {
+const readBalanceCiphertext = async (
+  contract: DeployedXgbpContract,
+  accountId: Uint8Array,
+  operation: string,
+) => {
   const tx = await contract.callTx.balanceOf(accountId);
-  return tx.private.result;
+  return {
+    ciphertext: tx.private.result,
+    result: {
+      onchain: [txReference(operation, tx.public)],
+      local: [],
+    },
+  };
 };
 
 const refreshActorCache = async (
@@ -58,11 +115,17 @@ const refreshActorCache = async (
   state: XgbpPrivateState,
   actor: ActorName,
   plaintextBalance: bigint,
-): Promise<XgbpPrivateState> => {
+): Promise<RefreshResult> => {
   const account = describeActor(state, actor);
-  const ciphertext = await readBalanceCiphertext(contract, account.accountId);
+  const { ciphertext, result } = await readBalanceCiphertext(contract, account.accountId, `balanceOf(${actor})`);
   const cached = cachePlaintextForActor(state, actor, ciphertext, plaintextBalance);
-  return setActorBalance(cached, actor, plaintextBalance);
+  return {
+    state: setActorBalance(cached, actor, plaintextBalance),
+    result: mergeResults(
+      result,
+      local(`Cached ${actorLabel(actor)} plaintext balance = ${plaintextBalance.toString()} base units`),
+    ),
+  };
 };
 
 export const snapshot = async (providers: XgbpProviders): Promise<ContractSnapshot> => {
@@ -88,10 +151,14 @@ export const setKycRequired = async (
   providers: XgbpProviders,
   contract: DeployedXgbpContract,
   required: boolean,
-): Promise<void> => {
+): Promise<OperationResult> => {
   await activateActor(providers, 'issuer');
-  await contract.callTx.setKycRequired(required);
+  const tx = await contract.callTx.setKycRequired(required);
   await savePrivateState(providers, setKycRequiredFlag(await getPrivateState(providers), required));
+  return mergeResults(
+    { onchain: [txReference(`setKycRequired(${String(required)})`, tx.public)], local: [] },
+    local('Selected Issuer private-state/witness context', `Cached KYC required = ${String(required)}`),
+  );
 };
 
 export const setKycApproved = async (
@@ -99,21 +166,31 @@ export const setKycApproved = async (
   contract: DeployedXgbpContract,
   actor: ActorName,
   approved: boolean,
-): Promise<void> => {
+): Promise<OperationResult> => {
   const state = await activateActor(providers, 'issuer');
-  await contract.callTx.setKycApproved(describeActor(state, actor).accountId, approved);
+  const tx = await contract.callTx.setKycApproved(describeActor(state, actor).accountId, approved);
   await savePrivateState(providers, setActorKycApproved(await getPrivateState(providers), actor, approved));
+  return mergeResults(
+    { onchain: [txReference(`setKycApproved(${actor}, ${String(approved)})`, tx.public)], local: [] },
+    local('Selected Issuer private-state/witness context', `Cached ${actorLabel(actor)} KYC approved = ${String(approved)}`),
+  );
 };
 
 export const register = async (
   providers: XgbpProviders,
   contract: DeployedXgbpContract,
   actor: ActorName,
-): Promise<void> => {
+): Promise<OperationResult> => {
   const state = await activateActor(providers, actor);
-  await contract.callTx.register();
+  const tx = await contract.callTx.register();
   const registered = setActorRegistered(await getPrivateState(providers), actor, true);
-  await savePrivateState(providers, await refreshActorCache(contract, registered, actor, state.actors[actor].knownBalance));
+  const refreshed = await refreshActorCache(contract, registered, actor, state.actors[actor].knownBalance);
+  await savePrivateState(providers, refreshed.state);
+  return mergeResults(
+    { onchain: [txReference(`register(${actor})`, tx.public)], local: [] },
+    local(`Selected ${actorLabel(actor)} private-state/witness context`, `Cached ${actorLabel(actor)} registered = true`),
+    refreshed.result,
+  );
 };
 
 export const mint = async (
@@ -121,15 +198,22 @@ export const mint = async (
   contract: DeployedXgbpContract,
   actor: ActorName,
   amount: bigint,
-): Promise<void> => {
+): Promise<OperationResult> => {
   const state = await activateActor(providers, 'issuer');
   const recipient = describeActor(state, actor);
-  await contract.callTx.mint(recipient.accountId, amount);
+  const tx = await contract.callTx.mint(recipient.accountId, amount);
 
   const current = await getPrivateState(providers);
   const nextBalance = current.actors[actor].knownBalance + amount;
   const withBalance = await refreshActorCache(contract, current, actor, nextBalance);
-  await savePrivateState(providers, setTotalSupply(withBalance, current.totalSupply + amount));
+  const nextTotalSupply = current.totalSupply + amount;
+  await savePrivateState(providers, setTotalSupply(withBalance.state, nextTotalSupply));
+  return mergeResults(
+    { onchain: [txReference(`mint(${actor}, ${amount.toString()})`, tx.public)], local: [] },
+    local('Selected Issuer private-state/witness context'),
+    withBalance.result,
+    local(`Cached total supply = ${nextTotalSupply.toString()} base units`),
+  );
 };
 
 export const transfer = async (
@@ -138,16 +222,22 @@ export const transfer = async (
   from: ActorName,
   to: ActorName,
   amount: bigint,
-): Promise<void> => {
+): Promise<OperationResult> => {
   const state = await activateActor(providers, from);
-  await contract.callTx.transfer(describeActor(state, to).accountId, amount);
+  const tx = await contract.callTx.transfer(describeActor(state, to).accountId, amount);
 
   const current = await getPrivateState(providers);
   const fromBalance = current.actors[from].knownBalance - amount;
   const toBalance = current.actors[to].knownBalance + amount;
   const fromCached = await refreshActorCache(contract, current, from, fromBalance);
-  const toCached = await refreshActorCache(contract, fromCached, to, toBalance);
-  await savePrivateState(providers, toCached);
+  const toCached = await refreshActorCache(contract, fromCached.state, to, toBalance);
+  await savePrivateState(providers, toCached.state);
+  return mergeResults(
+    { onchain: [txReference(`transfer(${from}->${to}, ${amount.toString()})`, tx.public)], local: [] },
+    local(`Selected ${actorLabel(from)} private-state/witness context`),
+    fromCached.result,
+    toCached.result,
+  );
 };
 
 export const burn = async (
@@ -155,32 +245,47 @@ export const burn = async (
   contract: DeployedXgbpContract,
   actor: ActorName,
   amount: bigint,
-): Promise<void> => {
+): Promise<OperationResult> => {
   await activateActor(providers, actor);
-  await contract.callTx.burn(amount);
+  const tx = await contract.callTx.burn(amount);
 
   const current = await getPrivateState(providers);
   const nextBalance = current.actors[actor].knownBalance - amount;
   const withBalance = await refreshActorCache(contract, current, actor, nextBalance);
-  await savePrivateState(providers, setTotalSupply(withBalance, current.totalSupply - amount));
+  const nextTotalSupply = current.totalSupply - amount;
+  await savePrivateState(providers, setTotalSupply(withBalance.state, nextTotalSupply));
+  return mergeResults(
+    { onchain: [txReference(`burn(${actor}, ${amount.toString()})`, tx.public)], local: [] },
+    local(`Selected ${actorLabel(actor)} private-state/witness context`),
+    withBalance.result,
+    local(`Cached total supply = ${nextTotalSupply.toString()} base units`),
+  );
 };
 
 export const freeze = async (
   providers: XgbpProviders,
   contract: DeployedXgbpContract,
   actor: ActorName,
-): Promise<void> => {
+): Promise<OperationResult> => {
   const state = await activateActor(providers, 'issuer');
-  await contract.callTx.freeze(describeActor(state, actor).accountId);
+  const tx = await contract.callTx.freeze(describeActor(state, actor).accountId);
   await savePrivateState(providers, setActorFrozen(await getPrivateState(providers), actor, true));
+  return mergeResults(
+    { onchain: [txReference(`freeze(${actor})`, tx.public)], local: [] },
+    local('Selected Issuer private-state/witness context', `Cached ${actorLabel(actor)} frozen = true`),
+  );
 };
 
 export const unfreeze = async (
   providers: XgbpProviders,
   contract: DeployedXgbpContract,
   actor: ActorName,
-): Promise<void> => {
+): Promise<OperationResult> => {
   const state = await activateActor(providers, 'issuer');
-  await contract.callTx.unfreeze(describeActor(state, actor).accountId);
+  const tx = await contract.callTx.unfreeze(describeActor(state, actor).accountId);
   await savePrivateState(providers, setActorFrozen(await getPrivateState(providers), actor, false));
+  return mergeResults(
+    { onchain: [txReference(`unfreeze(${actor})`, tx.public)], local: [] },
+    local('Selected Issuer private-state/witness context', `Cached ${actorLabel(actor)} frozen = false`),
+  );
 };
