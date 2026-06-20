@@ -1,10 +1,10 @@
 import { spawnSync } from 'node:child_process';
 import net from 'node:net';
 import path from 'node:path';
+import { dockerProjectName } from './branding.js';
 
 const projectRoot = path.resolve(new URL(import.meta.url).pathname, '..', '..', '..');
 const composeFile = path.join(projectRoot, 'infra', 'standalone.yml');
-const projectName = 'xgbp-local';
 const localPorts = [9944, 8088, 6300] as const;
 
 function runDocker(args: string[]): void {
@@ -27,19 +27,19 @@ export async function localNetworkUp(): Promise<void> {
     await assertLocalPortsAvailable();
   }
 
-  runDocker(['compose', '-p', projectName, '-f', composeFile, 'up', '-d']);
+  runDocker(['compose', '-p', dockerProjectName, '-f', composeFile, 'up', '-d']);
 }
 
 export function localNetworkDown(): void {
-  runDocker(['compose', '-p', projectName, '-f', composeFile, 'down']);
+  runDocker(['compose', '-p', dockerProjectName, '-f', composeFile, 'down']);
 }
 
 export function localNetworkStatus(): void {
-  runDocker(['compose', '-p', projectName, '-f', composeFile, 'ps']);
+  runDocker(['compose', '-p', dockerProjectName, '-f', composeFile, 'ps']);
 }
 
 function projectHasRunningContainers(): boolean {
-  const result = spawnSync('docker', ['compose', '-p', projectName, '-f', composeFile, 'ps', '--status', 'running', '-q'], {
+  const result = spawnSync('docker', ['compose', '-p', dockerProjectName, '-f', composeFile, 'ps', '--status', 'running', '-q'], {
     cwd: projectRoot,
     encoding: 'utf8',
   });

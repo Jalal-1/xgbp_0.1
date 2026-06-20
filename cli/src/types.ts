@@ -1,4 +1,4 @@
-import type { XGBP, XgbpPrivateState } from '@xgbp/xgbp-contract';
+import type { XGBP, XgbpPrivateState } from '@shielded-template/contract';
 import type { ProvableCircuitId } from '@midnight-ntwrk/compact-js';
 import type { DeployedContract, FoundContract } from '@midnight-ntwrk/midnight-js-contracts';
 import type { MidnightProviders } from '@midnight-ntwrk/midnight-js-types';

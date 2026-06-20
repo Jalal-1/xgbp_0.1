@@ -1,5 +1,5 @@
 {
-  "name": "@xgbp/xgbp-cli",
+  "name": "@shielded-template/cli",
   "version": "0.1.0",
   "private": true,
   "type": "module",
@@ -9,7 +9,7 @@
     "start": "node --no-deprecation dist/main.js"
   },
   "dependencies": {
-    "@xgbp/xgbp-contract": "*",
+    "@shielded-template/contract": "*",
     "@midnight-ntwrk/compact-js": "2.5.1",
     "@midnight-ntwrk/ledger-v8": "8.1.0",
     "@midnight-ntwrk/midnight-js-contracts": "4.1.1",

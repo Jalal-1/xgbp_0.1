@@ -1,11 +1,21 @@
 import { stdin as input, stdout as output } from 'node:process';
 import { emitKeypressEvents } from 'node:readline';
 import { inspect } from 'node:util';
-import { actorNames, shortHex, type ActorName } from '@xgbp/xgbp-contract';
+import { actorNames, shortHex, type ActorName } from '@shielded-template/contract';
+import {
+  activityHistoryLimit,
+  appName,
+  minTerminalHeight,
+  minTerminalWidth,
+  sampleContractName,
+  sampleToken,
+  visibleActivityRows,
+} from './branding.js';
 import { deployXgbp } from './deploy.js';
-import * as xgbp from './xgbp-api.js';
+import * as tokenApi from './token-api.js';
 import type { NetworkConfig, NetworkName } from './config.js';
 import { configureProviders } from './providers.js';
+import { ansi, formatBox, joinColumns, padVisible, paint, truncate, wrapPlain } from './tui-format.js';
 import type { DeployedXgbpContract, XgbpProviders } from './types.js';
 import { buildWallet, type WalletContext } from './wallet.js';
 
@@ -72,7 +82,7 @@ type TuiState = {
   network: NetworkConfig;
   logVerbosity: LogVerbosity;
   session?: TuiSession;
-  snapshot?: xgbp.ContractSnapshot;
+  snapshot?: tokenApi.ContractSnapshot;
   changedKeys: Set<string>;
   flashOn: boolean;
   spinnerFrame: number;
@@ -87,10 +97,6 @@ type RunTuiOptions = {
   logVerbosity?: LogVerbosity;
 };
 
-const minWidth = 120;
-const minHeight = 38;
-const activityLimit = 200;
-const visibleActivityLimit = 7;
 const spinnerFrames = ['-', '\\', '|', '/'];
 const registryActors: ActorName[] = ['alice', 'bob'];
 const guidedChecklistTemplate: ReadonlyArray<Omit<ChecklistItem, 'status'>> = [
@@ -109,22 +115,6 @@ const guidedChecklistTemplate: ReadonlyArray<Omit<ChecklistItem, 'status'>> = [
   { id: 'transferAfterUnfreeze', label: 'Alice pays Bob 10' },
   { id: 'burnBob', label: 'Bob burns 25' },
 ];
-
-const ansi = {
-  clear: '\x1b[2J\x1b[H',
-  hideCursor: '\x1b[?25l',
-  showCursor: '\x1b[?25h',
-  reset: '\x1b[0m',
-  bold: '\x1b[1m',
-  gray: '\x1b[90m',
-  red: '\x1b[31m',
-  green: '\x1b[32m',
-  yellow: '\x1b[33m',
-  blue: '\x1b[34m',
-  magenta: '\x1b[35m',
-  cyan: '\x1b[36m',
-  highlight: '\x1b[30;43m',
-};
 
 const actorColor: Record<ActorName, string> = {
   issuer: ansi.cyan,
@@ -156,66 +146,6 @@ const checklistColor: Record<ChecklistStatus, string> = {
   failed: ansi.red,
 };
 
-const paint = (value: string, color: string): string => `${color}${value}${ansi.reset}`;
-const stripAnsi = (value: string): string => value.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, '');
-const visibleLength = (value: string): number => stripAnsi(value).length;
-
-const padVisible = (value: string, width: number): string => {
-  const length = visibleLength(value);
-  if (length >= width) return value;
-  return `${value}${' '.repeat(width - length)}`;
-};
-
-const truncate = (value: string, width: number): string => {
-  if (visibleLength(value) <= width) return value;
-  const plain = stripAnsi(value);
-  return `${plain.slice(0, Math.max(0, width - 3))}...`;
-};
-
-const wrapPlain = (value: string, width: number): string[] => {
-  const plain = stripAnsi(value);
-  if (width <= 0 || plain.length <= width) return [plain];
-
-  const lines: string[] = [];
-  for (let index = 0; index < plain.length; index += width) {
-    lines.push(plain.slice(index, index + width));
-  }
-  return lines;
-};
-
-const center = (value: string, width: number): string => {
-  const length = visibleLength(value);
-  if (length >= width) return value;
-  const left = Math.floor((width - length) / 2);
-  return `${' '.repeat(left)}${value}${' '.repeat(width - length - left)}`;
-};
-
-const formatBox = (title: string, lines: string[], width: number, height: number, color = ansi.bold): string[] => {
-  const inner = width - 2;
-  const bodyLines = height - 4;
-  const box = [`+${'-'.repeat(inner)}+`, `|${center(paint(title, color), inner)}|`, `+${'-'.repeat(inner)}+`];
-
-  for (let i = 0; i < bodyLines; i += 1) {
-    const line = lines[i] ?? '';
-    box.push(`|${padVisible(truncate(line, inner), inner)}|`);
-  }
-
-  box.push(`+${'-'.repeat(inner)}+`);
-  return box;
-};
-
-const joinColumns = (columns: string[][], gap = 2): string[] => {
-  const height = Math.max(...columns.map((column) => column.length));
-  const spacer = ' '.repeat(gap);
-  const rows: string[] = [];
-
-  for (let row = 0; row < height; row += 1) {
-    rows.push(columns.map((column) => column[row] ?? '').join(spacer));
-  }
-
-  return rows;
-};
-
 const actorLabel = (actor: ActorName): string => {
   switch (actor) {
     case 'issuer':
@@ -236,7 +166,7 @@ const formatUnits = (value: bigint, decimals: bigint): string => {
   return `${whole.toLocaleString()}.${fraction}`;
 };
 
-const key = (actor: ActorName, field: keyof xgbp.ActorStatus): string => `${actor}.${field}`;
+const key = (actor: ActorName, field: keyof tokenApi.ActorStatus): string => `${actor}.${field}`;
 
 const flash = (state: TuiState, id: string, value: string): string =>
   state.flashOn && state.changedKeys.has(id) ? paint(value, ansi.highlight) : value;
@@ -267,12 +197,12 @@ const resetGuidedChecklist = (state: TuiState): void => {
 };
 
 const scrollLogs = (state: TuiState, delta: number): void => {
-  const maxOffset = Math.max(0, state.activity.length - (visibleActivityLimit - 1));
+  const maxOffset = Math.max(0, state.activity.length - (visibleActivityRows - 1));
   state.logScrollOffset = Math.max(0, Math.min(maxOffset, state.logScrollOffset + delta));
   render(state);
 };
 
-const flattenSnapshot = (snapshot: xgbp.ContractSnapshot): Record<string, string> => {
+const flattenSnapshot = (snapshot: tokenApi.ContractSnapshot): Record<string, string> => {
   const flat: Record<string, string> = {
     kycRequired: String(snapshot.kycRequired),
     totalSupply: snapshot.totalSupply.toString(),
@@ -294,7 +224,7 @@ const rememberSnapshot = async (state: TuiState): Promise<void> => {
   // The TUI never invents balances or registry state. This snapshot is the
   // local private-state cache, updated only after real contract calls succeed.
   const previous = state.snapshot === undefined ? undefined : flattenSnapshot(state.snapshot);
-  const next = await xgbp.snapshot(state.session.providers);
+  const next = await tokenApi.snapshot(state.session.providers);
   const current = flattenSnapshot(next);
   const changed = new Set<string>();
 
@@ -310,10 +240,10 @@ const rememberSnapshot = async (state: TuiState): Promise<void> => {
 
 const pushActivity = (state: TuiState, level: ActivityLevel, source: ActivitySource, text: string): void => {
   const wasViewingOlderLogs = state.logScrollOffset > 0;
-  state.activity = [...state.activity, { level, source, text }].slice(-activityLimit);
+  state.activity = [...state.activity, { level, source, text }].slice(-activityHistoryLimit);
 
   if (wasViewingOlderLogs) {
-    const maxOffset = Math.max(0, state.activity.length - (visibleActivityLimit - 1));
+    const maxOffset = Math.max(0, state.activity.length - (visibleActivityRows - 1));
     state.logScrollOffset = Math.min(maxOffset, state.logScrollOffset + 1);
   }
 };
@@ -391,13 +321,13 @@ const pulseChangedValues = async (state: TuiState): Promise<void> => {
 };
 
 const renderStartup = (state: TuiState): string[] => [
-  paint('XGBP TUI', ansi.bold),
+  paint(appName, ansi.bold),
   '',
   `Network: ${paint(state.networkName, ansi.cyan)}`,
   '',
   'Select action:',
   '',
-  `  ${paint('1', ansi.cyan)}  Deploy new XGBP contract`,
+  `  ${paint('1', ansi.cyan)}  Deploy new ${sampleToken.symbol} contract`,
   `  ${paint('2', ansi.cyan)}  Exit`,
   '',
   ...renderActivity(state),
@@ -406,7 +336,7 @@ const renderStartup = (state: TuiState): string[] => [
 const renderSmallScreen = (state: TuiState, width: number, height: number): string[] => {
   const actions =
     state.session === undefined
-      ? ['1 Deploy new XGBP contract', '2 Exit']
+      ? [`1 Deploy new ${sampleToken.symbol} contract`, '2 Exit']
       : [
           '1 Guided flow',
           '2 KYC/register actors',
@@ -423,7 +353,7 @@ const renderSmallScreen = (state: TuiState, width: number, height: number): stri
         ];
 
   const topLines = [
-    `Terminal too small. Resize to at least ${minWidth}x${minHeight}.`,
+    `Terminal too small. Resize to at least ${minTerminalWidth}x${minTerminalHeight}.`,
     `Current size: ${width}x${height}.`,
     '',
     'Available actions:',
@@ -441,7 +371,7 @@ const renderSmallScreen = (state: TuiState, width: number, height: number): stri
   return [...topLines, ...Array.from({ length: spacerRows }, () => ''), ...activityLines].slice(0, maxLines);
 };
 
-const actorStatus = (snapshot: xgbp.ContractSnapshot, actor: ActorName): xgbp.ActorStatus => {
+const actorStatus = (snapshot: tokenApi.ContractSnapshot, actor: ActorName): tokenApi.ActorStatus => {
   const status = snapshot.actors.find((candidate) => candidate.actor === actor);
   if (status === undefined) throw new Error(`Missing actor state for ${actor}`);
   return status;
@@ -467,7 +397,7 @@ const renderActorBox = (state: TuiState, actor: ActorName): string[] => {
       actor === 'issuer' || status.registered ? paint('2-of-3 on-chain', ansi.yellow) : paint('not registered', ansi.gray)
     }`,
     ...actorNames.map((other) => {
-      const otherStatus = actorStatus(state.snapshot as xgbp.ContractSnapshot, other);
+      const otherStatus = actorStatus(state.snapshot as tokenApi.ContractSnapshot, other);
       const value =
         other === actor
           ? `${formatUnits(otherStatus.knownBalance, token.decimals)} ${token.symbol} (own)`
@@ -505,7 +435,7 @@ const renderRegistryBox = (state: TuiState): string[] => {
     `Sig verify  ${paint('demo stub', ansi.yellow)}`,
     'Actor     Registered  KYC  Frozen',
     ...registryActors.map((actor) => {
-      const status = actorStatus(state.snapshot as xgbp.ContractSnapshot, actor);
+      const status = actorStatus(state.snapshot as tokenApi.ContractSnapshot, actor);
       return `${actorLabel(actor).padEnd(9)} ${padVisible(
         boolView(state, key(actor, 'registered'), status.registered),
         11,
@@ -563,7 +493,7 @@ const shortRef = (value: string): string => {
   return `${value.slice(0, 10)}...${value.slice(-8)}`;
 };
 
-const formatTxReference = (reference: xgbp.TxReference): string =>
+const formatTxReference = (reference: tokenApi.TxReference): string =>
   `${reference.operation}: txId=${shortRef(reference.txId)} txHash=${shortRef(reference.txHash)} block=${
     reference.blockHeight
   } status=${reference.status}`;
@@ -652,7 +582,7 @@ const recordFailure = (
   pushActivity(state, expected ? 'success' : 'error', source, failureStageText(source));
 };
 
-const recordOperationResult = (state: TuiState, result: xgbp.OperationResult): void => {
+const recordOperationResult = (state: TuiState, result: tokenApi.OperationResult): void => {
   for (const message of result.local) {
     pushActivity(state, 'success', 'LOCAL', message);
   }
@@ -689,7 +619,7 @@ const renderActivity = (state: TuiState): string[] => {
 
   if (state.logScrollOffset > 0) {
     const end = Math.max(0, state.activity.length - state.logScrollOffset);
-    const start = Math.max(0, end - (visibleActivityLimit - 1));
+    const start = Math.max(0, end - (visibleActivityRows - 1));
     const messages = state.activity.slice(start, end);
     return [
       logView,
@@ -712,7 +642,7 @@ const renderActivity = (state: TuiState): string[] => {
             message.source !== state.liveStatus.source ||
             message.text !== state.liveStatus.text,
         );
-  const historyLimit = state.liveStatus === undefined ? visibleActivityLimit - 1 : visibleActivityLimit - 2;
+  const historyLimit = state.liveStatus === undefined ? visibleActivityRows - 1 : visibleActivityRows - 2;
   const visibleHistory = history.slice(-historyLimit);
   const messages = state.liveStatus === undefined ? visibleHistory : [...visibleHistory, state.liveStatus];
   if (messages.length === 0) return [logView, paint('No activity yet.', ansi.gray)];
@@ -742,7 +672,7 @@ const renderLogsBox = (state: TuiState): string[] => {
 const renderDashboard = (state: TuiState): string[] => {
   const contractAddress = state.session?.contract.deployTxData.public.contractAddress;
   const header = [
-    `${paint('XGBP TUI', ansi.bold)} | network ${paint(state.networkName, ansi.cyan)} | contract ${
+    `${paint(appName, ansi.bold)} | sample ${paint(sampleContractName, ansi.yellow)} | network ${paint(state.networkName, ansi.cyan)} | contract ${
       contractAddress === undefined ? paint('not deployed', ansi.gray) : truncate(contractAddress, 38)
     }`,
   ];
@@ -779,7 +709,7 @@ const render = (state: TuiState): void => {
   const prompt =
     state.prompt === undefined ? '' : `\n${paint('> ', ansi.cyan)}${state.prompt.label}${state.prompt.buffer}`;
 
-  if (width < minWidth || height < minHeight) {
+  if (width < minTerminalWidth || height < minTerminalHeight) {
     output.write(`${ansi.clear}${renderSmallScreen(state, width, height).join('\n')}${prompt}`);
     return;
   }
@@ -841,12 +771,12 @@ const handleKeypress = (state: TuiState, value: string | undefined, key: Keypres
   }
 
   if (typed === '[' || key.name === 'pageup' || key.name === 'up') {
-    scrollLogs(state, visibleActivityLimit - 1);
+    scrollLogs(state, visibleActivityRows - 1);
     return;
   }
 
   if (typed === ']' || key.name === 'pagedown' || key.name === 'down') {
-    scrollLogs(state, -(visibleActivityLimit - 1));
+    scrollLogs(state, -(visibleActivityRows - 1));
     return;
   }
 
@@ -889,7 +819,7 @@ const runStep = async (
   state: TuiState,
   actor: ActorName,
   description: string,
-  operation: () => Promise<xgbp.OperationResult>,
+  operation: () => Promise<tokenApi.OperationResult>,
   checklistStep?: GuidedStepId,
 ): Promise<boolean> => {
   try {
@@ -914,7 +844,7 @@ const runExpectedFailureStep = async (
   state: TuiState,
   actor: ActorName,
   description: string,
-  operation: () => Promise<xgbp.OperationResult>,
+  operation: () => Promise<tokenApi.OperationResult>,
   checklistStep: GuidedStepId,
 ): Promise<boolean> => {
   setChecklistStatus(state, checklistStep, 'active');
@@ -947,7 +877,7 @@ const deployNew = async (state: TuiState): Promise<void> => {
     return;
   }
 
-  const token: TokenMetadata = { name: 'XGBP', symbol: 'XGBP', decimals: 2n };
+  const token: TokenMetadata = { ...sampleToken };
   let walletContext: WalletContext | undefined;
 
   try {
@@ -964,7 +894,7 @@ const deployNew = async (state: TuiState): Promise<void> => {
     const providers = await runPending(state, 'LOCAL', 'Configuring providers: private state, indexer, proof server, ZK artifacts...', () =>
       configureProviders(walletContext as WalletContext, state.network),
     );
-    const contract = await runPending(state, 'ONCHAIN', 'Deploying XGBP contract and publishing verifier keys...', () =>
+    const contract = await runPending(state, 'ONCHAIN', `Deploying ${sampleContractName} contract and publishing verifier keys...`, () =>
       deployXgbp(providers, walletContext as WalletContext, state.networkName, {
         ...token,
         verifierKeyChunkSize: 8,
@@ -973,7 +903,7 @@ const deployNew = async (state: TuiState): Promise<void> => {
           setLiveStatus(state, 'pending', source, message);
           pushVerbosePending(state, source, message);
           if (tx !== undefined) {
-            pushActivity(state, 'success', 'ONCHAIN', formatTxReference(xgbp.txReference(message, tx)));
+            pushActivity(state, 'success', 'ONCHAIN', formatTxReference(tokenApi.txReference(message, tx)));
           }
           render(state);
         },
@@ -983,13 +913,13 @@ const deployNew = async (state: TuiState): Promise<void> => {
     state.session = { walletContext, providers, contract, token };
     await rememberSnapshot(state);
     const indexerStatus = await runPending(state, 'INDEXER', 'Reading deployed contract state from indexer...', () =>
-      xgbp.confirmContractIndexed(providers, contract),
+      tokenApi.confirmContractIndexed(providers, contract),
     );
     recordOperationResult(state, indexerStatus);
     setChecklistStatus(state, 'deploy', 'done');
     setChecklistStatus(state, 'actors', 'done');
-    setLiveStatus(state, 'success', 'SYSTEM', `XGBP deployed at ${contract.deployTxData.public.contractAddress}`);
-    pushActivity(state, 'success', 'SYSTEM', `XGBP deployed at ${contract.deployTxData.public.contractAddress}`);
+    setLiveStatus(state, 'success', 'SYSTEM', `${sampleToken.symbol} deployed at ${contract.deployTxData.public.contractAddress}`);
+    pushActivity(state, 'success', 'SYSTEM', `${sampleToken.symbol} deployed at ${contract.deployTxData.public.contractAddress}`);
   } catch (error) {
     await walletContext?.wallet.stop();
     const source = classifyFailureSource(error);
@@ -1028,7 +958,7 @@ const kycAndRegisterActors = async (state: TuiState, guided = false): Promise<vo
       state,
       'issuer',
       'set KYC required',
-      () => xgbp.setKycRequired(session.providers, session.contract, true),
+      () => tokenApi.setKycRequired(session.providers, session.contract, true),
       guided ? 'kycRequired' : undefined,
     );
   }
@@ -1041,7 +971,7 @@ const kycAndRegisterActors = async (state: TuiState, guided = false): Promise<vo
         state,
         'issuer',
         `set KYC approved for ${actorLabel(actor)}`,
-        () => xgbp.setKycApproved(session.providers, session.contract, actor, true),
+        () => tokenApi.setKycApproved(session.providers, session.contract, actor, true),
         guided ? step : undefined,
       );
     } else {
@@ -1053,7 +983,7 @@ const kycAndRegisterActors = async (state: TuiState, guided = false): Promise<vo
     const status = state.snapshot === undefined ? undefined : actorStatus(state.snapshot, actor);
     const step = registrationStepFor(actor);
     if (status?.registered !== true) {
-      await runStep(state, actor, 'register wallet', () => xgbp.register(session.providers, session.contract, actor), guided ? step : undefined);
+      await runStep(state, actor, 'register wallet', () => tokenApi.register(session.providers, session.contract, actor), guided ? step : undefined);
     } else {
       markDoneIfGuided(state, guided, step);
     }
@@ -1067,24 +997,24 @@ const guidedFlow = async (state: TuiState): Promise<void> => {
   pushActivity(state, 'info', 'SYSTEM', 'Guided flow started.');
   await kycAndRegisterActors(state, true);
   await runStep(state, 'issuer', 'mint 1000 base units to Alice', () =>
-    xgbp.mint(session.providers, session.contract, 'alice', 1000n),
+    tokenApi.mint(session.providers, session.contract, 'alice', 1000n),
     'mintAlice',
   );
   await runStep(state, 'alice', 'transfer 125 base units to Bob', () =>
-    xgbp.transfer(session.providers, session.contract, 'alice', 'bob', 125n),
+    tokenApi.transfer(session.providers, session.contract, 'alice', 'bob', 125n),
     'transferInitial',
   );
-  await runStep(state, 'issuer', 'freeze Bob', () => xgbp.freeze(session.providers, session.contract, 'bob'), 'freezeBob');
+  await runStep(state, 'issuer', 'freeze Bob', () => tokenApi.freeze(session.providers, session.contract, 'bob'), 'freezeBob');
   await runExpectedFailureStep(state, 'alice', 'attempt transfer 10 base units to frozen Bob', () =>
-    xgbp.transfer(session.providers, session.contract, 'alice', 'bob', 10n),
+    tokenApi.transfer(session.providers, session.contract, 'alice', 'bob', 10n),
     'blockedTransfer',
   );
-  await runStep(state, 'issuer', 'unfreeze Bob', () => xgbp.unfreeze(session.providers, session.contract, 'bob'), 'unfreezeBob');
+  await runStep(state, 'issuer', 'unfreeze Bob', () => tokenApi.unfreeze(session.providers, session.contract, 'bob'), 'unfreezeBob');
   await runStep(state, 'alice', 'transfer 10 base units to Bob', () =>
-    xgbp.transfer(session.providers, session.contract, 'alice', 'bob', 10n),
+    tokenApi.transfer(session.providers, session.contract, 'alice', 'bob', 10n),
     'transferAfterUnfreeze',
   );
-  await runStep(state, 'bob', 'burn 25 base units', () => xgbp.burn(session.providers, session.contract, 'bob', 25n), 'burnBob');
+  await runStep(state, 'bob', 'burn 25 base units', () => tokenApi.burn(session.providers, session.contract, 'bob', 25n), 'burnBob');
 };
 
 const mint = async (state: TuiState): Promise<void> => {
@@ -1098,7 +1028,7 @@ const mint = async (state: TuiState): Promise<void> => {
   }
 
   await runStep(state, 'issuer', `mint ${amount.toString()} base units to ${actorLabel(actor)}`, () =>
-    xgbp.mint(session.providers, session.contract, actor, amount),
+    tokenApi.mint(session.providers, session.contract, actor, amount),
   );
 };
 
@@ -1114,7 +1044,7 @@ const transfer = async (state: TuiState): Promise<void> => {
   }
 
   await runStep(state, from, `transfer ${amount.toString()} base units to ${actorLabel(to)}`, () =>
-    xgbp.transfer(session.providers, session.contract, from, to, amount),
+    tokenApi.transfer(session.providers, session.contract, from, to, amount),
   );
 };
 
@@ -1129,11 +1059,11 @@ const freezeOrUnfreeze = async (state: TuiState): Promise<void> => {
   }
 
   if (mode === 'f') {
-    await runStep(state, 'issuer', `freeze ${actorLabel(actor)}`, () => xgbp.freeze(session.providers, session.contract, actor));
+    await runStep(state, 'issuer', `freeze ${actorLabel(actor)}`, () => tokenApi.freeze(session.providers, session.contract, actor));
     return;
   }
 
-  await runStep(state, 'issuer', `unfreeze ${actorLabel(actor)}`, () => xgbp.unfreeze(session.providers, session.contract, actor));
+  await runStep(state, 'issuer', `unfreeze ${actorLabel(actor)}`, () => tokenApi.unfreeze(session.providers, session.contract, actor));
 };
 
 const burn = async (state: TuiState): Promise<void> => {
@@ -1147,7 +1077,7 @@ const burn = async (state: TuiState): Promise<void> => {
   }
 
   await runStep(state, actor, `burn ${amount.toString()} base units`, () =>
-    xgbp.burn(session.providers, session.contract, actor, amount),
+    tokenApi.burn(session.providers, session.contract, actor, amount),
   );
 };
 
@@ -1191,11 +1121,11 @@ const dashboardLoop = async (state: TuiState): Promise<void> => {
         break;
       case '[':
       case 'u':
-        scrollLogs(state, visibleActivityLimit - 1);
+        scrollLogs(state, visibleActivityRows - 1);
         break;
       case ']':
       case 'd':
-        scrollLogs(state, -(visibleActivityLimit - 1));
+        scrollLogs(state, -(visibleActivityRows - 1));
         break;
       case '0':
         state.logScrollOffset = 0;
@@ -1249,11 +1179,11 @@ export const runTui = async (networkName: NetworkName, network: NetworkConfig, o
           break;
         case '[':
         case 'u':
-          scrollLogs(state, visibleActivityLimit - 1);
+          scrollLogs(state, visibleActivityRows - 1);
           break;
         case ']':
         case 'd':
-          scrollLogs(state, -(visibleActivityLimit - 1));
+          scrollLogs(state, -(visibleActivityRows - 1));
           break;
         case '0':
           state.logScrollOffset = 0;

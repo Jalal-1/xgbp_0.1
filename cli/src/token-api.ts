@@ -16,7 +16,7 @@ import {
   shortHex,
   type ActorName,
   type XgbpPrivateState,
-} from '@xgbp/xgbp-contract';
+} from '@shielded-template/contract';
 import type { FinalizedTxData } from '@midnight-ntwrk/midnight-js-types';
 import { XgbpPrivateStateId, type DeployedXgbpContract, type XgbpProviders } from './types.js';
 
@@ -55,6 +55,9 @@ type RefreshResult = {
   state: XgbpPrivateState;
   result: OperationResult;
 };
+
+type CustodyApproval = ReturnType<typeof custodyApproval>;
+type SubmittedTx = { public: FinalizedTxData };
 
 export const txReference = (operation: string, tx: FinalizedTxData): TxReference => ({
   operation,
@@ -110,11 +113,17 @@ const activateActor = async (providers: XgbpProviders, actor: ActorName): Promis
   return state;
 };
 
+const selectedActorContext = (actor: ActorName): OperationResult =>
+  local(`Selected ${actorLabel(actor)} private-state/witness context`);
+
 const readBalanceCiphertext = async (
   contract: DeployedXgbpContract,
   accountId: Uint8Array,
   operation: string,
 ) => {
+  // Public state should be read through the indexer. This call is the current
+  // CFT demo bridge for wallet cache refresh: it gives the active wallet the
+  // latest encrypted balance cell whose plaintext it already tracks locally.
   const tx = await contract.callTx.balanceOf(accountId);
   return {
     ciphertext: tx.private.result,
@@ -170,6 +179,27 @@ const custodyApproval = (
 
 const custodyTxLabel = (operation: string): string => `${operation}; custody=2/3`;
 
+const runCustodyGatedTx = async (
+  providers: XgbpProviders,
+  controlledActor: ActorName,
+  action: string,
+  operation: string,
+  submit: (state: XgbpPrivateState, approval: CustodyApproval) => Promise<SubmittedTx>,
+): Promise<{ state: XgbpPrivateState; result: OperationResult }> => {
+  const state = await activateActor(providers, controlledActor);
+  const approval = custodyApproval(state, controlledActor, action);
+  const tx = await submit(state, approval);
+
+  return {
+    state,
+    result: mergeResults(
+      approval.result,
+      onchain(txReference(custodyTxLabel(operation), tx.public)),
+      selectedActorContext(controlledActor),
+    ),
+  };
+};
+
 const shortAddress = (value: string): string => {
   if (value.length <= 22) return value;
   return `${value.slice(0, 10)}...${value.slice(-8)}`;
@@ -212,15 +242,15 @@ export const setKycRequired = async (
   contract: DeployedXgbpContract,
   required: boolean,
 ): Promise<OperationResult> => {
-  const state = await activateActor(providers, 'issuer');
-  const approval = custodyApproval(state, 'issuer', `set KYC required = ${String(required)}`);
-  const tx = await contract.callTx.setKycRequired(required, approval.pubkeys, approval.signatures);
-  await savePrivateState(providers, setKycRequiredFlag(await getPrivateState(providers), required));
-  return mergeResults(
-    approval.result,
-    onchain(txReference(custodyTxLabel(`setKycRequired(${String(required)})`), tx.public)),
-    local('Selected Issuer private-state/witness context', `Cached KYC required = ${String(required)}`),
+  const tx = await runCustodyGatedTx(
+    providers,
+    'issuer',
+    `set KYC required = ${String(required)}`,
+    `setKycRequired(${String(required)})`,
+    (_state, approval) => contract.callTx.setKycRequired(required, approval.pubkeys, approval.signatures),
   );
+  await savePrivateState(providers, setKycRequiredFlag(await getPrivateState(providers), required));
+  return mergeResults(tx.result, local(`Cached KYC required = ${String(required)}`));
 };
 
 export const setKycApproved = async (
@@ -229,15 +259,16 @@ export const setKycApproved = async (
   actor: ActorName,
   approved: boolean,
 ): Promise<OperationResult> => {
-  const state = await activateActor(providers, 'issuer');
-  const approval = custodyApproval(state, 'issuer', `set ${actorLabel(actor)} KYC approved = ${String(approved)}`);
-  const tx = await contract.callTx.setKycApproved(describeActor(state, actor).accountId, approved, approval.pubkeys, approval.signatures);
-  await savePrivateState(providers, setActorKycApproved(await getPrivateState(providers), actor, approved));
-  return mergeResults(
-    approval.result,
-    onchain(txReference(custodyTxLabel(`setKycApproved(${actor}, ${String(approved)})`), tx.public)),
-    local('Selected Issuer private-state/witness context', `Cached ${actorLabel(actor)} KYC approved = ${String(approved)}`),
+  const tx = await runCustodyGatedTx(
+    providers,
+    'issuer',
+    `set ${actorLabel(actor)} KYC approved = ${String(approved)}`,
+    `setKycApproved(${actor}, ${String(approved)})`,
+    (state, approval) =>
+      contract.callTx.setKycApproved(describeActor(state, actor).accountId, approved, approval.pubkeys, approval.signatures),
   );
+  await savePrivateState(providers, setActorKycApproved(await getPrivateState(providers), actor, approved));
+  return mergeResults(tx.result, local(`Cached ${actorLabel(actor)} KYC approved = ${String(approved)}`));
 };
 
 export const register = async (
@@ -258,7 +289,8 @@ export const register = async (
       'Register transaction stores the signer set in the embedded XGBP custody ledger',
     ),
     onchain(txReference(`register(${actor})`, tx.public)),
-    local(`Selected ${actorLabel(actor)} private-state/witness context`, `Cached ${actorLabel(actor)} registered = true`),
+    selectedActorContext(actor),
+    local(`Cached ${actorLabel(actor)} registered = true`),
     refreshed.result,
   );
 };
@@ -269,10 +301,14 @@ export const mint = async (
   actor: ActorName,
   amount: bigint,
 ): Promise<OperationResult> => {
-  const state = await activateActor(providers, 'issuer');
-  const recipient = describeActor(state, actor);
-  const approval = custodyApproval(state, 'issuer', `mint ${amount.toString()} base units to ${actorLabel(actor)}`);
-  const tx = await contract.callTx.mint(recipient.accountId, amount, approval.pubkeys, approval.signatures);
+  const tx = await runCustodyGatedTx(
+    providers,
+    'issuer',
+    `mint ${amount.toString()} base units to ${actorLabel(actor)}`,
+    `mint(${actor}, ${amount.toString()})`,
+    (state, approval) =>
+      contract.callTx.mint(describeActor(state, actor).accountId, amount, approval.pubkeys, approval.signatures),
+  );
 
   const current = await getPrivateState(providers);
   const nextBalance = current.actors[actor].knownBalance + amount;
@@ -280,9 +316,7 @@ export const mint = async (
   const nextTotalSupply = current.totalSupply + amount;
   await savePrivateState(providers, setTotalSupply(withBalance.state, nextTotalSupply));
   return mergeResults(
-    approval.result,
-    onchain(txReference(custodyTxLabel(`mint(${actor}, ${amount.toString()})`), tx.public)),
-    local('Selected Issuer private-state/witness context'),
+    tx.result,
     withBalance.result,
     local(`Cached total supply = ${nextTotalSupply.toString()} base units`),
   );
@@ -295,9 +329,13 @@ export const transfer = async (
   to: ActorName,
   amount: bigint,
 ): Promise<OperationResult> => {
-  const state = await activateActor(providers, from);
-  const approval = custodyApproval(state, from, `transfer ${amount.toString()} base units to ${actorLabel(to)}`);
-  const tx = await contract.callTx.transfer(describeActor(state, to).accountId, amount, approval.pubkeys, approval.signatures);
+  const tx = await runCustodyGatedTx(
+    providers,
+    from,
+    `transfer ${amount.toString()} base units to ${actorLabel(to)}`,
+    `transfer(${from}->${to}, ${amount.toString()})`,
+    (state, approval) => contract.callTx.transfer(describeActor(state, to).accountId, amount, approval.pubkeys, approval.signatures),
+  );
 
   const current = await getPrivateState(providers);
   const fromBalance = current.actors[from].knownBalance - amount;
@@ -306,9 +344,7 @@ export const transfer = async (
   const toCached = await refreshActorCache(contract, fromCached.state, to, toBalance);
   await savePrivateState(providers, toCached.state);
   return mergeResults(
-    approval.result,
-    onchain(txReference(custodyTxLabel(`transfer(${from}->${to}, ${amount.toString()})`), tx.public)),
-    local(`Selected ${actorLabel(from)} private-state/witness context`),
+    tx.result,
     fromCached.result,
     toCached.result,
   );
@@ -320,9 +356,13 @@ export const burn = async (
   actor: ActorName,
   amount: bigint,
 ): Promise<OperationResult> => {
-  const state = await activateActor(providers, actor);
-  const approval = custodyApproval(state, actor, `burn ${amount.toString()} base units`);
-  const tx = await contract.callTx.burn(amount, approval.pubkeys, approval.signatures);
+  const tx = await runCustodyGatedTx(
+    providers,
+    actor,
+    `burn ${amount.toString()} base units`,
+    `burn(${actor}, ${amount.toString()})`,
+    (_state, approval) => contract.callTx.burn(amount, approval.pubkeys, approval.signatures),
+  );
 
   const current = await getPrivateState(providers);
   const nextBalance = current.actors[actor].knownBalance - amount;
@@ -330,9 +370,7 @@ export const burn = async (
   const nextTotalSupply = current.totalSupply - amount;
   await savePrivateState(providers, setTotalSupply(withBalance.state, nextTotalSupply));
   return mergeResults(
-    approval.result,
-    onchain(txReference(custodyTxLabel(`burn(${actor}, ${amount.toString()})`), tx.public)),
-    local(`Selected ${actorLabel(actor)} private-state/witness context`),
+    tx.result,
     withBalance.result,
     local(`Cached total supply = ${nextTotalSupply.toString()} base units`),
   );
@@ -343,15 +381,15 @@ export const freeze = async (
   contract: DeployedXgbpContract,
   actor: ActorName,
 ): Promise<OperationResult> => {
-  const state = await activateActor(providers, 'issuer');
-  const approval = custodyApproval(state, 'issuer', `freeze ${actorLabel(actor)}`);
-  const tx = await contract.callTx.freeze(describeActor(state, actor).accountId, approval.pubkeys, approval.signatures);
-  await savePrivateState(providers, setActorFrozen(await getPrivateState(providers), actor, true));
-  return mergeResults(
-    approval.result,
-    onchain(txReference(custodyTxLabel(`freeze(${actor})`), tx.public)),
-    local('Selected Issuer private-state/witness context', `Cached ${actorLabel(actor)} frozen = true`),
+  const tx = await runCustodyGatedTx(
+    providers,
+    'issuer',
+    `freeze ${actorLabel(actor)}`,
+    `freeze(${actor})`,
+    (state, approval) => contract.callTx.freeze(describeActor(state, actor).accountId, approval.pubkeys, approval.signatures),
   );
+  await savePrivateState(providers, setActorFrozen(await getPrivateState(providers), actor, true));
+  return mergeResults(tx.result, local(`Cached ${actorLabel(actor)} frozen = true`));
 };
 
 export const unfreeze = async (
@@ -359,13 +397,13 @@ export const unfreeze = async (
   contract: DeployedXgbpContract,
   actor: ActorName,
 ): Promise<OperationResult> => {
-  const state = await activateActor(providers, 'issuer');
-  const approval = custodyApproval(state, 'issuer', `unfreeze ${actorLabel(actor)}`);
-  const tx = await contract.callTx.unfreeze(describeActor(state, actor).accountId, approval.pubkeys, approval.signatures);
-  await savePrivateState(providers, setActorFrozen(await getPrivateState(providers), actor, false));
-  return mergeResults(
-    approval.result,
-    onchain(txReference(custodyTxLabel(`unfreeze(${actor})`), tx.public)),
-    local('Selected Issuer private-state/witness context', `Cached ${actorLabel(actor)} frozen = false`),
+  const tx = await runCustodyGatedTx(
+    providers,
+    'issuer',
+    `unfreeze ${actorLabel(actor)}`,
+    `unfreeze(${actor})`,
+    (state, approval) => contract.callTx.unfreeze(describeActor(state, actor).accountId, approval.pubkeys, approval.signatures),
   );
+  await savePrivateState(providers, setActorFrozen(await getPrivateState(providers), actor, false));
+  return mergeResults(tx.result, local(`Cached ${actorLabel(actor)} frozen = false`));
 };

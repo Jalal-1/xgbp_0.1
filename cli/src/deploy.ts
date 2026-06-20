@@ -25,7 +25,8 @@ import {
   initialIssuerAccountId,
   custodySignerCommitmentsForActor,
   type XgbpPrivateState,
-} from '@xgbp/xgbp-contract';
+} from '@shielded-template/contract';
+import { deploymentDirName, deploymentSubdirName, sampleContractName } from './branding.js';
 import { artifactPath } from './providers.js';
 import { XgbpPrivateStateId, type DeployedXgbpContract, type XgbpCircuitId, type XgbpProviders } from './types.js';
 import type { WalletContext } from './wallet.js';
@@ -40,7 +41,7 @@ export type DeployOptions = {
 
 const witnesses = createXgbpWitnesses();
 
-const compiledContract = CompiledContract.make<XGBP.Contract<XgbpPrivateState>>('XGBP', XGBP.Contract).pipe(
+const compiledContract = CompiledContract.make<XGBP.Contract<XgbpPrivateState>>(sampleContractName, XGBP.Contract).pipe(
   CompiledContract.withWitnesses(witnesses),
   CompiledContract.withCompiledFileAssets(artifactPath),
 );
@@ -64,7 +65,7 @@ const saveDeployment = async (
   contractAddress: ContractAddress,
   options: DeployOptions,
 ): Promise<void> => {
-  const dir = path.join(projectRoot, '.xgbp', 'deployments');
+  const dir = path.join(projectRoot, deploymentDirName, deploymentSubdirName);
   await mkdir(dir, { recursive: true });
   await writeFile(
     path.join(dir, `${networkName}.json`),
@@ -98,7 +99,7 @@ const submitDeployTransaction = async (
     signingKey,
   });
 
-  await report(options, 'Running XGBP constructor locally: token metadata, issuer custody, initial ledger state...');
+  await report(options, `Running ${sampleContractName} constructor locally: token metadata, issuer custody, initial ledger state...`);
   const issuerSignerCommitments = custodySignerCommitmentsForActor(initialPrivateState, 'issuer');
   const exitResult = await contractRuntime.runPromiseExit(
     (contractExec as any).initialize(
@@ -278,9 +279,9 @@ export const deployXgbp = async (
   const contractAddress = await submitDeployTransaction(providers, walletContext, initialPrivateState, options);
 
   await publishVerifierKeysAdaptive(providers, contractAddress, options);
-  await report(options, 'Binding CLI session to deployed XGBP contract...');
+  await report(options, `Binding CLI session to deployed ${sampleContractName} contract...`);
   const contract = await joinContract(providers, contractAddress);
-  await report(options, 'Saving deployment record under .xgbp/deployments/...');
+  await report(options, `Saving deployment record under ${deploymentDirName}/${deploymentSubdirName}/...`);
   await saveDeployment(networkName, contract.deployTxData.public.contractAddress as ContractAddress, options);
 
   return contract;

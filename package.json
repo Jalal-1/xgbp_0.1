@@ -1,5 +1,5 @@
 {
-  "name": "xgbp_0.1",
+  "name": "shielded-integration-template",
   "version": "0.1.0",
   "private": true,
   "type": "module",
@@ -8,18 +8,18 @@
     "cli"
   ],
   "scripts": {
-    "compact": "npm -w @xgbp/xgbp-contract run compact",
-    "build:contract": "npm -w @xgbp/xgbp-contract run build",
-    "build:cli": "npm -w @xgbp/xgbp-cli run build",
+    "compact": "npm -w @shielded-template/contract run compact",
+    "build:contract": "npm -w @shielded-template/contract run build",
+    "build:cli": "npm -w @shielded-template/cli run build",
     "build": "npm run build:contract && npm run build:cli",
-    "cli": "npm -w @xgbp/xgbp-cli run start --",
+    "cli": "npm -w @shielded-template/cli run start --",
     "tui": "npm run cli -- tui",
     "deploy": "npm run cli -- deploy",
     "deploy:fresh": "npm run build && npm run deploy --",
     "network:up": "npm run cli -- network up",
     "network:down": "npm run cli -- network down",
     "network:status": "npm run cli -- network status",
-    "typecheck": "npm -w @xgbp/xgbp-contract run typecheck && npm -w @xgbp/xgbp-cli run typecheck"
+    "typecheck": "npm -w @shielded-template/contract run typecheck && npm -w @shielded-template/cli run typecheck"
   },
   "devDependencies": {
     "@openzeppelin/compact-cli": "^0.0.2",

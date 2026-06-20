@@ -1,5 +1,5 @@
 {
-  "name": "@xgbp/xgbp-contract",
+  "name": "@shielded-template/contract",
   "version": "0.1.0",
   "private": true,
   "type": "module",

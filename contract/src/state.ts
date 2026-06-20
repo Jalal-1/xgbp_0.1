@@ -43,6 +43,9 @@ export type XgbpPrivateState = {
 const bytes32Type = new CompactTypeVector(1, new CompactTypeBytes(32));
 const encoder = new TextEncoder();
 
+// The template uses deterministic demo personas so guided runs are reproducible.
+// A real custodian integration must source account keys, custody public keys,
+// and signatures from its own wallet/HSM/key-management boundary.
 const deterministicBytes = (label: string, length: number): Uint8Array => {
   const source = encoder.encode(label);
   const key = new Uint8Array(length);
@@ -135,6 +138,9 @@ export const custodyApprovalForActor = (
   actor: ActorName,
 ): { pubkeys: Uint8Array[]; signatures: Uint8Array[]; labels: CustodySignerLabel[] } => {
   const signers = normalizeXgbpPrivateState(state).actors[actor].custodySigners;
+  // Demo policy: user + custodian approve. The Compact contract only sees two
+  // public keys/signatures and enforces membership, uniqueness, threshold, and
+  // replay protection on-chain.
   const selected = [signers[0], signers[2]];
   return {
     pubkeys: selected.map((signer) => signer.publicKey),

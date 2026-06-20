@@ -6,6 +6,7 @@ import { NodeZkConfigProvider } from '@midnight-ntwrk/midnight-js-node-zk-config
 import type { MidnightProvider, UnboundTransaction, WalletProvider } from '@midnight-ntwrk/midnight-js-types';
 import * as Rx from 'rxjs';
 import { WebSocket } from 'ws';
+import { privateStatePassword, privateStateStoreName, sampleContractName } from './branding.js';
 import type { NetworkConfig } from './config.js';
 import type { XgbpCircuitId, XgbpPrivateStateId, XgbpProviders } from './types.js';
 import type { WalletContext } from './wallet.js';
@@ -13,10 +14,7 @@ import type { WalletContext } from './wallet.js';
 // Apollo subscriptions used by the indexer provider need a WebSocket in Node.
 globalThis.WebSocket = WebSocket as unknown as typeof globalThis.WebSocket;
 
-const privateStatePassword = 'XGBP_Private_State_0.1';
-const privateStateStoreName = 'xgbp-private-state';
-
-export const artifactPath = new URL('../../contract/dist/artifacts/XGBP/', import.meta.url).pathname;
+export const artifactPath = new URL(`../../contract/dist/artifacts/${sampleContractName}/`, import.meta.url).pathname;
 
 const createWalletAndMidnightProvider = async (
   ctx: WalletContext,

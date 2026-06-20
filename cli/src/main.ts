@@ -1,4 +1,5 @@
 import { deployXgbp } from './deploy.js';
+import { appName, sampleToken } from './branding.js';
 import { isNetworkName, networks, selectNetwork } from './config.js';
 import { localNetworkDown, localNetworkStatus, localNetworkUp } from './docker.js';
 import { configureProviders } from './providers.js';
@@ -49,10 +50,10 @@ function optionBoolean(options: CliOptions, key: string): boolean {
 
 function usage(): void {
   console.log(`
-XGBP CLI
+${appName} CLI
 
 Usage:
-  npm run cli -- deploy [--network local] [--name XGBP] [--symbol XGBP] [--decimals 2] [--vk-chunk-size 8] [--seed <hex>]
+  npm run cli -- deploy [--network local] [--name ${sampleToken.name}] [--symbol ${sampleToken.symbol}] [--decimals ${sampleToken.decimals.toString()}] [--vk-chunk-size 8] [--seed <hex>]
   npm run cli -- tui [--network local] [--verbose]
   npm run cli -- network up
   npm run cli -- network down
@@ -115,9 +116,9 @@ async function main(argv: string[]): Promise<void> {
 
     const network = selectNetwork(networkName);
     const deployOptions = {
-      name: optionString(options, 'name', 'XGBP'),
-      symbol: optionString(options, 'symbol', 'XGBP'),
-      decimals: BigInt(optionInteger(options, 'decimals', 2)),
+      name: optionString(options, 'name', sampleToken.name),
+      symbol: optionString(options, 'symbol', sampleToken.symbol),
+      decimals: BigInt(optionInteger(options, 'decimals', Number(sampleToken.decimals))),
       verifierKeyChunkSize: optionInteger(options, 'vk-chunk-size', 8),
     };
     const seed = typeof options.seed === 'string' ? options.seed : undefined;
@@ -128,7 +129,7 @@ async function main(argv: string[]): Promise<void> {
       const providers = await configureProviders(wallet, network);
       const contract = await deployXgbp(providers, wallet, networkName, deployOptions);
 
-      console.log(`XGBP deployed: ${contract.deployTxData.public.contractAddress}`);
+      console.log(`${sampleToken.symbol} deployed: ${contract.deployTxData.public.contractAddress}`);
     } finally {
       await wallet?.wallet.stop();
     }
