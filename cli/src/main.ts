@@ -42,13 +42,18 @@ function optionInteger(options: CliOptions, key: string, fallback: number): numb
   return value;
 }
 
+function optionBoolean(options: CliOptions, key: string): boolean {
+  const value = options[key];
+  return value === true || value === 'true';
+}
+
 function usage(): void {
   console.log(`
 XGBP CLI
 
 Usage:
   npm run cli -- deploy [--network local] [--name XGBP] [--symbol XGBP] [--decimals 2] [--vk-chunk-size 8] [--seed <hex>]
-  npm run cli -- tui [--network local]
+  npm run cli -- tui [--network local] [--verbose]
   npm run cli -- network up
   npm run cli -- network down
   npm run cli -- network status
@@ -95,7 +100,9 @@ async function main(argv: string[]): Promise<void> {
       throw new Error(`Unknown network: ${networkName}`);
     }
 
-    await runTui(networkName, selectNetwork(networkName));
+    await runTui(networkName, selectNetwork(networkName), {
+      logVerbosity: optionBoolean(options, 'verbose') ? 'verbose' : 'normal',
+    });
     return;
   }
 

@@ -14,7 +14,7 @@ pragma language_version >= 0.23.0;
  * freezer roles), the same way a token gates `_mint` / `_burn`.
  *
  * Identity is an abstract `Bytes<32>` account identifier, matching the
- * convention used by `ConfidentialFungibleToken` and `Ownable`
+ * convention used by `ConfidentialFungibleToken` and `CustodyMultisig`
  * (`accountId = persistentHash(secretKey)`). The registry never derives or
  * authenticates an identity itself — callers pass the account to check.
  *

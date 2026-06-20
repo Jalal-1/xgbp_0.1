@@ -1,5 +1,6 @@
 import { stdin as input, stdout as output } from 'node:process';
 import { emitKeypressEvents } from 'node:readline';
+import { inspect } from 'node:util';
 import { actorNames, shortHex, type ActorName } from '@xgbp/xgbp-contract';
 import { deployXgbp } from './deploy.js';
 import * as xgbp from './xgbp-api.js';
@@ -9,7 +10,8 @@ import type { DeployedXgbpContract, XgbpProviders } from './types.js';
 import { buildWallet, type WalletContext } from './wallet.js';
 
 type ActivityLevel = 'info' | 'pending' | 'success' | 'error';
-type ActivitySource = 'ONCHAIN' | 'LOCAL' | 'SYSTEM';
+type ActivitySource = 'ONCHAIN' | 'INDEXER' | 'CONTRACT' | 'LOCAL' | 'CUSTODY' | 'SYSTEM';
+type LogVerbosity = 'normal' | 'verbose';
 
 type ActivityMessage = {
   level: ActivityLevel;
@@ -68,6 +70,7 @@ type TuiSession = {
 type TuiState = {
   networkName: NetworkName;
   network: NetworkConfig;
+  logVerbosity: LogVerbosity;
   session?: TuiSession;
   snapshot?: xgbp.ContractSnapshot;
   changedKeys: Set<string>;
@@ -78,6 +81,10 @@ type TuiState = {
   logScrollOffset: number;
   checklist: ChecklistItem[];
   prompt?: PromptState;
+};
+
+type RunTuiOptions = {
+  logVerbosity?: LogVerbosity;
 };
 
 const minWidth = 120;
@@ -134,7 +141,10 @@ const levelColor: Record<ActivityLevel, string> = {
 
 const sourceColor: Record<ActivitySource, string> = {
   ONCHAIN: ansi.cyan,
+  INDEXER: ansi.blue,
+  CONTRACT: ansi.red,
   LOCAL: ansi.magenta,
+  CUSTODY: ansi.yellow,
   SYSTEM: ansi.gray,
 };
 
@@ -160,6 +170,17 @@ const truncate = (value: string, width: number): string => {
   if (visibleLength(value) <= width) return value;
   const plain = stripAnsi(value);
   return `${plain.slice(0, Math.max(0, width - 3))}...`;
+};
+
+const wrapPlain = (value: string, width: number): string[] => {
+  const plain = stripAnsi(value);
+  if (width <= 0 || plain.length <= width) return [plain];
+
+  const lines: string[] = [];
+  for (let index = 0; index < plain.length; index += width) {
+    lines.push(plain.slice(index, index + width));
+  }
+  return lines;
 };
 
 const center = (value: string, width: number): string => {
@@ -297,8 +318,29 @@ const pushActivity = (state: TuiState, level: ActivityLevel, source: ActivitySou
   }
 };
 
+const pushActivityText = (state: TuiState, level: ActivityLevel, source: ActivitySource, text: string): void => {
+  const chunkSize = 128;
+  for (const line of text.split('\n')) {
+    if (line.length === 0) continue;
+    for (let index = 0; index < line.length; index += chunkSize) {
+      pushActivity(state, level, source, line.slice(index, index + chunkSize));
+    }
+  }
+};
+
 const setLiveStatus = (state: TuiState, level: ActivityLevel, source: ActivitySource, text: string): void => {
   state.liveStatus = { level, source, text };
+};
+
+const pushVerbosePending = (state: TuiState, source: ActivitySource, text: string): void => {
+  if (state.logVerbosity === 'verbose') {
+    pushActivity(state, 'pending', source, text);
+  }
+};
+
+const toggleLogVerbosity = (state: TuiState): void => {
+  state.logVerbosity = state.logVerbosity === 'normal' ? 'verbose' : 'normal';
+  render(state);
 };
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
@@ -324,7 +366,7 @@ const runPending = async <T>(
   operation: () => Promise<T>,
 ): Promise<T> => {
   setLiveStatus(state, 'pending', source, message);
-  pushActivity(state, 'pending', source, message);
+  pushVerbosePending(state, source, message);
   render(state);
   return await animateWhile(state, operation());
 };
@@ -374,12 +416,13 @@ const renderSmallScreen = (state: TuiState, width: number, height: number): stri
           '6 Burn',
           '7 Refresh',
           '8 Exit',
+          'v Toggle verbose logs',
           '[ Older logs',
           '] Newer logs',
           '0 Latest logs',
         ];
 
-  return [
+  const topLines = [
     `Terminal too small. Resize to at least ${minWidth}x${minHeight}.`,
     `Current size: ${width}x${height}.`,
     '',
@@ -387,9 +430,15 @@ const renderSmallScreen = (state: TuiState, width: number, height: number): stri
     ...actions.map((action) => `  ${action}`),
     '',
     'Resize for the fixed dashboard view.',
-    '',
-    ...renderActivity(state),
   ];
+
+  const maxLines = Math.max(1, height - (state.prompt === undefined ? 0 : 1));
+  const activity = renderActivity(state);
+  const availableActivityRows = Math.max(0, maxLines - topLines.length - 1);
+  const activityLines = activity.slice(-availableActivityRows);
+  const spacerRows = Math.max(0, maxLines - topLines.length - activityLines.length);
+
+  return [...topLines, ...Array.from({ length: spacerRows }, () => ''), ...activityLines].slice(0, maxLines);
 };
 
 const actorStatus = (snapshot: xgbp.ContractSnapshot, actor: ActorName): xgbp.ActorStatus => {
@@ -414,6 +463,9 @@ const renderActorBox = (state: TuiState, actor: ActorName): string[] => {
           key(actor, 'kycApproved'),
           status.kycApproved,
         )} F:${boolView(state, key(actor, 'frozen'), status.frozen)}`,
+    `Custody    ${
+      actor === 'issuer' || status.registered ? paint('2-of-3 on-chain', ansi.yellow) : paint('not registered', ansi.gray)
+    }`,
     ...actorNames.map((other) => {
       const otherStatus = actorStatus(state.snapshot as xgbp.ContractSnapshot, other);
       const value =
@@ -445,10 +497,12 @@ const renderPublicBox = (state: TuiState): string[] => {
 };
 
 const renderRegistryBox = (state: TuiState): string[] => {
-  if (state.snapshot === undefined) return formatBox('KYC / Freeze Registry', [], 58, 10);
+  if (state.snapshot === undefined) return formatBox('KYC Registry / Freeze List', [], 58, 10);
 
   const lines = [
     `KYC required ${boolView(state, 'kycRequired', state.snapshot.kycRequired)}`,
+    `Custody     ${paint('2-of-3 on-chain', ansi.yellow)}`,
+    `Sig verify  ${paint('demo stub', ansi.yellow)}`,
     'Actor     Registered  KYC  Frozen',
     ...registryActors.map((actor) => {
       const status = actorStatus(state.snapshot as xgbp.ContractSnapshot, actor);
@@ -463,7 +517,7 @@ const renderRegistryBox = (state: TuiState): string[] => {
     }),
   ];
 
-  return formatBox('KYC / Freeze Registry', lines, 58, 10, ansi.green);
+  return formatBox('KYC Registry / Freeze List', lines, 58, 10, ansi.green);
 };
 
 const checklistMarker = (status: ChecklistStatus): string => {
@@ -514,9 +568,101 @@ const formatTxReference = (reference: xgbp.TxReference): string =>
     reference.blockHeight
   } status=${reference.status}`;
 
+const errorText = (error: unknown): string =>
+  error instanceof Error ? error.message : String(error);
+
+const diagnosticValue = (value: unknown, depth = 0): unknown => {
+  if (depth > 5) return '[MaxDepth]';
+
+  if (value instanceof Error) {
+    const details: Record<string, unknown> = {
+      name: value.name,
+      message: value.message,
+    };
+
+    for (const [key, entry] of Object.entries(value as unknown as Record<string, unknown>)) {
+      if (key !== 'stack' && key !== 'message') {
+        details[key] = diagnosticValue(entry, depth + 1);
+      }
+    }
+
+    if ('cause' in value && value.cause !== undefined) {
+      details.cause = diagnosticValue(value.cause, depth + 1);
+    }
+
+    return details;
+  }
+
+  if (Array.isArray(value)) {
+    return value.map((entry) => diagnosticValue(entry, depth + 1));
+  }
+
+  if (value !== null && typeof value === 'object') {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>)
+        .filter(([key]) => key !== 'stack')
+        .map(([key, entry]) => [key, diagnosticValue(entry, depth + 1)]),
+    );
+  }
+
+  return value;
+};
+
+const rawErrorText = (error: unknown): string =>
+  inspect(diagnosticValue(error), { depth: 6, breakLength: 140, maxArrayLength: 25 });
+
+const classifyFailureSource = (error: unknown): ActivitySource => {
+  const text = rawErrorText(error);
+  if (/RpcError|Transaction submission|Invalid Transaction|blockHeight|txId|txHash|SucceedEntirely|FailedTransaction/i.test(text)) {
+    return 'ONCHAIN';
+  }
+  if (/ComplianceRegistry|ConfidentialFungibleToken|CustodyMultisig|assert|circuit|Circuit/i.test(text)) {
+    return 'CONTRACT';
+  }
+  return 'LOCAL';
+};
+
+const failureStageText = (source: ActivitySource): string => {
+  if (source === 'CONTRACT') {
+    return 'Failure stage: Compact contract/circuit rejected before a finalized tx reference was returned.';
+  }
+  if (source === 'ONCHAIN') {
+    return 'Failure stage: on-chain submission/finality returned an error.';
+  }
+  return 'Failure stage: local wallet/provider logic returned an error before submission.';
+};
+
+const recordFailure = (
+  state: TuiState,
+  actor: ActorName,
+  description: string,
+  error: unknown,
+  expected: boolean,
+): void => {
+  const source = classifyFailureSource(error);
+  const summary = errorText(error);
+  const raw = rawErrorText(error);
+  const prefix = expected ? 'Rejected as expected' : `Acting as ${actorLabel(actor)}: ${description} failed`;
+
+  if (state.logVerbosity === 'verbose' && raw !== summary) {
+    pushActivityText(state, 'info', source, `Diagnostic detail: ${raw}`);
+  }
+  setLiveStatus(state, expected ? 'success' : 'error', source, expected ? `Rejected as expected: ${description}` : `${prefix}: ${summary}`);
+  pushActivity(state, expected ? 'success' : 'error', source, `${prefix}: ${summary}`);
+  pushActivity(state, expected ? 'success' : 'error', source, failureStageText(source));
+};
+
 const recordOperationResult = (state: TuiState, result: xgbp.OperationResult): void => {
   for (const message of result.local) {
     pushActivity(state, 'success', 'LOCAL', message);
+  }
+
+  for (const message of result.indexer) {
+    pushActivity(state, 'success', 'INDEXER', message);
+  }
+
+  for (const message of result.custody) {
+    pushActivity(state, 'success', 'CUSTODY', message);
   }
 
   for (const reference of result.onchain) {
@@ -534,10 +680,12 @@ const deployProgressSource = (message: string, hasTx: boolean): ActivitySource =
 };
 
 const renderActivity = (state: TuiState): string[] => {
+  const mode = state.logVerbosity === 'verbose' ? ` ${paint('VERBOSE', ansi.yellow)}` : '';
+  const keys = 'keys [:older ]:newer 0:latest v:mode';
   const logView =
     state.logScrollOffset === 0
-      ? paint('View: latest   keys: [ older  ] newer  0 latest', ansi.gray)
-      : paint(`View: ${state.logScrollOffset} line(s) older   keys: [ older  ] newer  0 latest`, ansi.gray);
+      ? `${paint('View', ansi.gray)}${mode}${paint(`: latest | ${keys}`, ansi.gray)}`
+      : `${paint('View', ansi.gray)}${mode}${paint(`: ${state.logScrollOffset} older | ${keys}`, ansi.gray)}`;
 
   if (state.logScrollOffset > 0) {
     const end = Math.max(0, state.activity.length - state.logScrollOffset);
@@ -566,17 +714,29 @@ const renderActivity = (state: TuiState): string[] => {
         );
   const historyLimit = state.liveStatus === undefined ? visibleActivityLimit - 1 : visibleActivityLimit - 2;
   const visibleHistory = history.slice(-historyLimit);
-  const messages = state.liveStatus === undefined ? visibleHistory : [state.liveStatus, ...visibleHistory];
+  const messages = state.liveStatus === undefined ? visibleHistory : [...visibleHistory, state.liveStatus];
   if (messages.length === 0) return [logView, paint('No activity yet.', ansi.gray)];
 
   return [
     logView,
-    ...messages.map((message, index) => {
-      const isLivePending = index === 0 && state.liveStatus?.level === 'pending';
+    ...messages.map((message) => {
+      const isLivePending = message === state.liveStatus && state.liveStatus?.level === 'pending';
       const label = isLivePending ? `${spinnerFrames[state.spinnerFrame]} WAIT` : message.level.toUpperCase().padEnd(7);
       return `${paint(label, levelColor[message.level])} ${paint(`[${message.source}]`, sourceColor[message.source])} ${message.text}`;
     }),
   ];
+};
+
+const renderLogsBox = (state: TuiState): string[] => {
+  const width = 66;
+  const height = 11;
+  const inner = width - 2;
+  const bodyLines = height - 4;
+  const [header, ...activity] = renderActivity(state);
+  const wrappedActivity = activity.flatMap((line) => wrapPlain(line, inner));
+  const visibleActivity = wrappedActivity.slice(-Math.max(0, bodyLines - 1));
+
+  return formatBox('Logs', [header, ...visibleActivity], width, height, ansi.blue);
 };
 
 const renderDashboard = (state: TuiState): string[] => {
@@ -593,7 +753,7 @@ const renderDashboard = (state: TuiState): string[] => {
     '',
     ...joinColumns([renderPublicBox(state), renderRegistryBox(state)]),
     '',
-    ...joinColumns([renderChecklistBox(state), formatBox('Logs', renderActivity(state), 66, 11, ansi.blue)]),
+    ...joinColumns([renderChecklistBox(state), renderLogsBox(state)]),
     '+--------------------------------------------------------------------------------------------------------------------+',
     `|${padVisible(
       ` ${paint('1', ansi.cyan)} Guided flow   ${paint('2', ansi.cyan)} KYC/register   ${paint('3', ansi.cyan)} Mint   ${paint(
@@ -606,7 +766,7 @@ const renderDashboard = (state: TuiState): string[] => {
       ` ${paint('6', ansi.cyan)} Burn   ${paint('7', ansi.cyan)} Refresh   ${paint('8', ansi.cyan)} Exit   ${paint(
         '[',
         ansi.cyan,
-      )} Older logs   ${paint(']', ansi.cyan)} Newer logs   ${paint('0', ansi.cyan)} Latest logs`,
+      )} Older logs   ${paint(']', ansi.cyan)} Newer logs   ${paint('0', ansi.cyan)} Latest   ${paint('v', ansi.cyan)} Verbose`,
       116,
     )}|`,
     '+--------------------------------------------------------------------------------------------------------------------+',
@@ -664,26 +824,33 @@ const finishPrompt = (state: TuiState, value: string): void => {
   prompt.resolve(value);
 };
 
-const handleKeypress = (state: TuiState, value: string, key: Keypress): void => {
+const handleKeypress = (state: TuiState, value: string | undefined, key: Keypress): void => {
+  const typed = value ?? '';
+
   if (key.ctrl === true && key.name === 'c') {
     finishPrompt(state, '8');
     return;
   }
 
-  if (value === '[' || key.name === 'pageup') {
+  const promptAcceptsControlKeys =
+    state.prompt === undefined || (state.prompt.label === 'Select action: ' && state.prompt.buffer.length === 0);
+
+  if (typed.toLowerCase() === 'v' && promptAcceptsControlKeys) {
+    toggleLogVerbosity(state);
+    return;
+  }
+
+  if (typed === '[' || key.name === 'pageup' || key.name === 'up') {
     scrollLogs(state, visibleActivityLimit - 1);
     return;
   }
 
-  if (value === ']' || key.name === 'pagedown') {
+  if (typed === ']' || key.name === 'pagedown' || key.name === 'down') {
     scrollLogs(state, -(visibleActivityLimit - 1));
     return;
   }
 
-  const isSelectActionPrompt =
-    state.prompt !== undefined && state.prompt.label === 'Select action: ' && state.prompt.buffer.length === 0;
-
-  if ((value === '0' && (state.prompt === undefined || isSelectActionPrompt)) || key.name === 'home') {
+  if ((typed === '0' && promptAcceptsControlKeys) || key.name === 'home') {
     state.logScrollOffset = 0;
     render(state);
     return;
@@ -709,11 +876,11 @@ const handleKeypress = (state: TuiState, value: string, key: Keypress): void => 
     return;
   }
 
-  if (key.ctrl === true || key.meta === true || value.length === 0) return;
+  if (key.ctrl === true || key.meta === true || typed.length === 0) return;
 
-  const codePoint = value.codePointAt(0);
+  const codePoint = typed.codePointAt(0);
   if (codePoint !== undefined && codePoint >= 32 && codePoint !== 127) {
-    prompt.buffer += value;
+    prompt.buffer += typed;
     render(state);
   }
 };
@@ -736,10 +903,8 @@ const runStep = async (
     await pulseChangedValues(state);
     return true;
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
     if (checklistStep !== undefined) setChecklistStatus(state, checklistStep, 'failed');
-    setLiveStatus(state, 'error', 'ONCHAIN', `Acting as ${actorLabel(actor)}: ${description} failed: ${message}`);
-    pushActivity(state, 'error', 'ONCHAIN', `Acting as ${actorLabel(actor)}: ${description} failed: ${message}`);
+    recordFailure(state, actor, description, error, false);
     render(state);
     return false;
   }
@@ -764,10 +929,8 @@ const runExpectedFailureStep = async (
     await pulseChangedValues(state);
     return false;
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
     setChecklistStatus(state, checklistStep, 'done');
-    setLiveStatus(state, 'success', 'ONCHAIN', `Rejected as expected: ${description}`);
-    pushActivity(state, 'success', 'ONCHAIN', `Rejected as expected: ${message}`);
+    recordFailure(state, actor, description, error, true);
     render(state);
     return true;
   }
@@ -793,7 +956,7 @@ const deployNew = async (state: TuiState): Promise<void> => {
         printSeed: state.networkName !== 'local',
         onProgress: (message) => {
           setLiveStatus(state, 'pending', 'LOCAL', message);
-          pushActivity(state, 'pending', 'LOCAL', message);
+          pushVerbosePending(state, 'LOCAL', message);
           render(state);
         },
       }),
@@ -808,7 +971,7 @@ const deployNew = async (state: TuiState): Promise<void> => {
         onProgress: (message, tx) => {
           const source = deployProgressSource(message, tx !== undefined);
           setLiveStatus(state, 'pending', source, message);
-          pushActivity(state, 'pending', source, message);
+          pushVerbosePending(state, source, message);
           if (tx !== undefined) {
             pushActivity(state, 'success', 'ONCHAIN', formatTxReference(xgbp.txReference(message, tx)));
           }
@@ -819,15 +982,23 @@ const deployNew = async (state: TuiState): Promise<void> => {
 
     state.session = { walletContext, providers, contract, token };
     await rememberSnapshot(state);
+    const indexerStatus = await runPending(state, 'INDEXER', 'Reading deployed contract state from indexer...', () =>
+      xgbp.confirmContractIndexed(providers, contract),
+    );
+    recordOperationResult(state, indexerStatus);
     setChecklistStatus(state, 'deploy', 'done');
     setChecklistStatus(state, 'actors', 'done');
     setLiveStatus(state, 'success', 'SYSTEM', `XGBP deployed at ${contract.deployTxData.public.contractAddress}`);
     pushActivity(state, 'success', 'SYSTEM', `XGBP deployed at ${contract.deployTxData.public.contractAddress}`);
   } catch (error) {
     await walletContext?.wallet.stop();
-    const message = error instanceof Error ? error.message : String(error);
-    setLiveStatus(state, 'error', 'ONCHAIN', `Deploy failed: ${message}`);
-    pushActivity(state, 'error', 'ONCHAIN', `Deploy failed: ${message}`);
+    const source = classifyFailureSource(error);
+    const message = errorText(error);
+    const raw = rawErrorText(error);
+    if (state.logVerbosity === 'verbose' && raw !== message) pushActivityText(state, 'info', source, `Diagnostic detail: ${raw}`);
+    setLiveStatus(state, 'error', source, `Deploy failed: ${message}`);
+    pushActivity(state, 'error', source, `Deploy failed: ${message}`);
+    pushActivity(state, 'error', source, failureStageText(source));
   }
 };
 
@@ -1015,6 +1186,9 @@ const dashboardLoop = async (state: TuiState): Promise<void> => {
         break;
       case '8':
         return;
+      case 'v':
+        toggleLogVerbosity(state);
+        break;
       case '[':
       case 'u':
         scrollLogs(state, visibleActivityLimit - 1);
@@ -1034,10 +1208,11 @@ const dashboardLoop = async (state: TuiState): Promise<void> => {
   }
 };
 
-export const runTui = async (networkName: NetworkName, network: NetworkConfig): Promise<void> => {
+export const runTui = async (networkName: NetworkName, network: NetworkConfig, options: RunTuiOptions = {}): Promise<void> => {
   const state: TuiState = {
     networkName,
     network,
+    logVerbosity: options.logVerbosity ?? 'normal',
     changedKeys: new Set(),
     flashOn: false,
     spinnerFrame: 0,
@@ -1047,7 +1222,7 @@ export const runTui = async (networkName: NetworkName, network: NetworkConfig): 
     checklist: createChecklist(),
   };
   const wasRaw = input.isTTY === true && input.isRaw === true;
-  const onKeypress = (value: string, key: Keypress): void => handleKeypress(state, value, key);
+  const onKeypress = (value: string | undefined, key: Keypress): void => handleKeypress(state, value, key);
 
   emitKeypressEvents(input);
   input.on('keypress', onKeypress);
@@ -1068,6 +1243,9 @@ export const runTui = async (networkName: NetworkName, network: NetworkConfig): 
           break;
         case '2':
           done = true;
+          break;
+        case 'v':
+          toggleLogVerbosity(state);
           break;
         case '[':
         case 'u':

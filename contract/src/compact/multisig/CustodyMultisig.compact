@@ -1,0 +1,191 @@
+// SPDX-License-Identifier: MIT
+// Based on OpenZeppelin Compact Contracts v0.0.1-alpha.1
+// (multisig/Signer.compact and multisig/presets/ShieldedMultiSigV3.compact).
+
+pragma language_version >= 0.23.0;
+
+/**
+ * @module CustodyMultisig
+ * @description Demo custody gate for account-based XGBP operations.
+ *
+ * Each controlled account has exactly three signer commitments and every
+ * gated operation requires two distinct signer public keys whose commitments
+ * belong to that account. The verification flow follows the OpenZeppelin
+ * multisig example: signer commitment check, duplicate signer check, threshold
+ * check, and a per-operation nonce in the signed message hash.
+ *
+ * @warning Demo-only: `stubVerifySignature` intentionally returns true, as in
+ * the referenced example. Production requires a real Compact-verifiable
+ * signature primitive.
+ */
+module CustodyMultisig {
+  import CompactStandardLibrary;
+
+  struct VerificationState {
+    account: Bytes<32>,
+    validCount: Uint<8>,
+    prevCommitment: Bytes<32>,
+    msgHash: Bytes<32>
+  }
+
+  struct OperationHashInput {
+    operation: Bytes<32>,
+    contractAddress: Bytes<32>,
+    account: Bytes<32>,
+    nonce: Bytes<32>,
+    argsHash: Bytes<32>
+  }
+
+  struct SignerCommitmentInput {
+    pk: Bytes<64>,
+    salt: Bytes<32>,
+    domain: Bytes<32>
+  }
+
+  struct SignerSet {
+    signer0: Bytes<32>,
+    signer1: Bytes<32>,
+    signer2: Bytes<32>
+  }
+
+  export ledger _counter: Counter;
+  export ledger _instanceSalt: Bytes<32>;
+  export ledger _issuer: Bytes<32>;
+  export ledger _custodyRegistered: Map<Bytes<32>, Boolean>;
+  export ledger _signers: Map<Bytes<32>, SignerSet>;
+
+  export circuit initialize(
+    instanceSalt: Bytes<32>,
+    issuerAccount: Bytes<32>,
+    issuerSigner0: Bytes<32>,
+    issuerSigner1: Bytes<32>,
+    issuerSigner2: Bytes<32>
+  ): [] {
+    _instanceSalt = disclose(instanceSalt);
+    _issuer = disclose(issuerAccount);
+    _registerAccount(issuerAccount, issuerSigner0, issuerSigner1, issuerSigner2);
+  }
+
+  export circuit issuer(): Bytes<32> {
+    return _issuer;
+  }
+
+  export circuit getNonce(): Uint<64> {
+    return _counter;
+  }
+
+  export circuit getThreshold(): Uint<8> {
+    return 2 as Uint<8>;
+  }
+
+  export circuit getSignerCount(account: Bytes<32>): Uint<8> {
+    if (!isCustodyRegistered(account)) {
+      return 0 as Uint<8>;
+    }
+
+    return 3 as Uint<8>;
+  }
+
+  export circuit isCustodyRegistered(account: Bytes<32>): Boolean {
+    return _custodyRegistered.member(disclose(account)) &&
+           _custodyRegistered.lookup(disclose(account));
+  }
+
+  export circuit isSigner(account: Bytes<32>, commitment: Bytes<32>): Boolean {
+    if (!_signers.member(disclose(account))) {
+      return false;
+    }
+
+    const signers = _signers.lookup(disclose(account));
+    return signers.signer0 == commitment ||
+           signers.signer1 == commitment ||
+           signers.signer2 == commitment;
+  }
+
+  export circuit _registerAccount(
+    account: Bytes<32>,
+    signer0: Bytes<32>,
+    signer1: Bytes<32>,
+    signer2: Bytes<32>
+  ): [] {
+    assert(!isCustodyRegistered(account), "CustodyMultisig: account already registered");
+    assert(signer0 != signer1, "CustodyMultisig: duplicate signer");
+    assert(signer0 != signer2, "CustodyMultisig: duplicate signer");
+    assert(signer1 != signer2, "CustodyMultisig: duplicate signer");
+
+    _signers.insert(
+      disclose(account),
+      disclose(SignerSet { signer0: signer0, signer1: signer1, signer2: signer2 })
+    );
+    _custodyRegistered.insert(disclose(account), true);
+  }
+
+  export circuit assertApproval(
+    account: Bytes<32>,
+    operation: Bytes<32>,
+    argsHash: Bytes<32>,
+    pubkeys: Vector<2, Bytes<64>>,
+    signatures: Vector<2, Bytes<64>>
+  ): [] {
+    assert(isCustodyRegistered(account), "CustodyMultisig: account not registered");
+
+    const opNonce = _counter;
+    _counter.increment(1);
+
+    const msgHash = persistentHash<OperationHashInput>(OperationHashInput {
+      operation: operation,
+      contractAddress: kernel.self().bytes,
+      account: account,
+      nonce: opNonce as Bytes<32>,
+      argsHash: argsHash
+    });
+
+    const initialState = VerificationState {
+      account: account,
+      validCount: 0 as Uint<8>,
+      prevCommitment: pad(32, ""),
+      msgHash: msgHash
+    };
+
+    const finalState = fold(verifySignature, initialState, pubkeys, signatures);
+    assert(finalState.validCount >= 2 as Uint<8>, "CustodyMultisig: threshold not met");
+  }
+
+  circuit verifySignature(
+    state: VerificationState,
+    pubkey: Bytes<64>,
+    signature: Bytes<64>
+  ): VerificationState {
+    const commitment = calculateSignerId(pubkey, _instanceSalt);
+
+    assert(commitment != state.prevCommitment, "CustodyMultisig: duplicate signer");
+    assert(isSigner(state.account, commitment), "CustodyMultisig: unknown signer");
+    assert(stubVerifySignature(pubkey, state.msgHash, signature), "CustodyMultisig: invalid signature");
+
+    return VerificationState {
+      account: state.account,
+      validCount: state.validCount + 1 as Uint<8>,
+      prevCommitment: commitment,
+      msgHash: state.msgHash
+    };
+  }
+
+  export pure circuit calculateSignerId(
+    pk: Bytes<64>,
+    salt: Bytes<32>
+  ): Bytes<32> {
+    return persistentHash<SignerCommitmentInput>(SignerCommitmentInput {
+      pk: pk,
+      salt: salt,
+      domain: pad(32, "Multisig:signer:")
+    });
+  }
+
+  circuit stubVerifySignature(
+    pubkey: Bytes<64>,
+    msgHash: Bytes<32>,
+    signature: Bytes<64>
+  ): Boolean {
+    return true;
+  }
+}

@@ -12,7 +12,7 @@ pragma language_version >= 0.23.0;
  * Composition:
  *  - `ConfidentialFungibleToken` (CFT_) — confidential balances + escrow.
  *  - `ComplianceRegistry` (Compliance_) — freeze + KYC state and checks.
- *  - `Ownable` (Ownable_) — single issuer authority gating admin operations.
+ *  - `CustodyMultisig` (Custody_) — per-account 2-of-3 approval gate.
  *
  * @dev Gating pattern. Compliance is enforced HERE, in the wrapper, never in
  * the base token. Two cases:
@@ -25,40 +25,54 @@ pragma language_version >= 0.23.0;
  *    anywhere in a Compact circuit reverts the whole transaction, the post-call
  *    check still prevents the operation.
  *
- * @dev Authority. `Ownable` gates only operations that are NOT caller-
- * authenticated by CFT (mint and the compliance mutators); those take their
- * target as an explicit argument, so there is no witness clash between
- * `wit_OwnableSK` (the issuer) and `wit_ConfidentialTokenSK` (a holder). A
- * production deployment wanting segregation of duties (separate MINTER /
- * FREEZER authorities) swaps `Ownable` for `ShieldedAccessControl` behind the
- * same `assertOnly*` seams.
+ * @dev Authority. Mutating operations are approved by a per-account 2-of-3
+ * custody set. Issuer controls mint/compliance operations; holder/source
+ * accounts control transfers, approvals, and burns.
  */
 import CompactStandardLibrary;
 import "../token/ConfidentialFungibleToken" prefix CFT_;
 import "../security/ComplianceRegistry" prefix Compliance_;
-import "../access/Ownable" prefix Ownable_;
+import "../multisig/CustodyMultisig" prefix Custody_;
 import "../crypto/ElGamal" prefix ElGamal_;
 
 export { CFT_EscrowEntry, ElGamal_Ciphertext };
 
 /**
- * @description Initializes the token metadata and sets the issuer (owner).
- * @param initialOwner - The issuer's `accountId` (`persistentHash(SK)`).
+ * @description Initializes token metadata and the issuer custody signer set.
+ * @param issuerAccount - The issuer's `accountId` (`persistentHash(SK)`).
  */
 constructor(
   name_: Opaque<"string">,
   symbol_: Opaque<"string">,
   decimals_: Uint<8>,
-  initialOwner: Bytes<32>
+  issuerAccount: Bytes<32>,
+  instanceSalt: Bytes<32>,
+  issuerSigner0: Bytes<32>,
+  issuerSigner1: Bytes<32>,
+  issuerSigner2: Bytes<32>
 ) {
   CFT_initialize(name_, symbol_, decimals_);
-  Ownable_initialize(
-    Either<Bytes<32>, ContractAddress> {
-      is_left: true,
-      left: initialOwner,
-      right: default<ContractAddress>
-    }
-  );
+  Custody_initialize(instanceSalt, issuerAccount, issuerSigner0, issuerSigner1, issuerSigner2);
+}
+
+pure circuit _boolArg(value: Boolean): Bytes<32> {
+  if (value) {
+    return pad(32, "true");
+  } else {
+    return pad(32, "false");
+  }
+}
+
+pure circuit _hashArgs1(a: Bytes<32>): Bytes<32> {
+  return persistentHash<Vector<1, Bytes<32>>>([a]);
+}
+
+pure circuit _hashArgs2(a: Bytes<32>, b: Bytes<32>): Bytes<32> {
+  return persistentHash<Vector<2, Bytes<32>>>([a, b]);
+}
+
+pure circuit _hashArgs3(a: Bytes<32>, b: Bytes<32>, c: Bytes<32>): Bytes<32> {
+  return persistentHash<Vector<3, Bytes<32>>>([a, b, c]);
 }
 
 // ---------------------------------------------------------------------------
@@ -69,9 +83,10 @@ constructor(
  * @description Registers the caller. When KYC is required, the caller must be
  * on the allowlist. Gated on the returned (caller) registrant id.
  */
-export circuit register(): Bytes<32> {
+export circuit register(signer0: Bytes<32>, signer1: Bytes<32>, signer2: Bytes<32>): Bytes<32> {
   const registrant = CFT_register();
   Compliance_assertKycApproved(registrant);
+  Custody__registerAccount(registrant, signer0, signer1, signer2);
   return registrant;
 }
 
@@ -79,10 +94,22 @@ export circuit register(): Bytes<32> {
  * @description Transfers `value` to `to`. Blocks frozen recipients (up front)
  * and frozen senders (on the returned caller id).
  */
-export circuit transfer(to: Bytes<32>, value: Uint<128>): Bytes<32> {
+export circuit transfer(
+  to: Bytes<32>,
+  value: Uint<128>,
+  pubkeys: Vector<2, Bytes<64>>,
+  signatures: Vector<2, Bytes<64>>
+): Bytes<32> {
   Compliance_assertNotFrozen(to);
   const sender = CFT_transfer(to, value);
   Compliance_assertNotFrozen(sender);
+  Custody_assertApproval(
+    sender,
+    pad(32, "xgbp:transfer"),
+    _hashArgs2(to, value as Bytes<32>),
+    pubkeys,
+    signatures
+  );
   return sender;
 }
 
@@ -93,12 +120,21 @@ export circuit transfer(to: Bytes<32>, value: Uint<128>): Bytes<32> {
 export circuit transferFrom(
   fromAddress: Bytes<32>,
   to: Bytes<32>,
-  value: Uint<128>
+  value: Uint<128>,
+  pubkeys: Vector<2, Bytes<64>>,
+  signatures: Vector<2, Bytes<64>>
 ): Bytes<32> {
   Compliance_assertNotFrozen(fromAddress);
   Compliance_assertNotFrozen(to);
   const spender = CFT_transferFrom(fromAddress, to, value);
   Compliance_assertNotFrozen(spender);
+  Custody_assertApproval(
+    fromAddress,
+    pad(32, "xgbp:transferFrom"),
+    _hashArgs3(spender, to, value as Bytes<32>),
+    pubkeys,
+    signatures
+  );
   return spender;
 }
 
@@ -106,10 +142,22 @@ export circuit transferFrom(
  * @description Approves `spender` for `value`. Blocks a frozen spender (up
  * front) and a frozen approver (on the returned caller id).
  */
-export circuit approve(spender: Bytes<32>, value: Uint<128>): Bytes<32> {
+export circuit approve(
+  spender: Bytes<32>,
+  value: Uint<128>,
+  pubkeys: Vector<2, Bytes<64>>,
+  signatures: Vector<2, Bytes<64>>
+): Bytes<32> {
   Compliance_assertNotFrozen(spender);
   const owner = CFT_approve(spender, value);
   Compliance_assertNotFrozen(owner);
+  Custody_assertApproval(
+    owner,
+    pad(32, "xgbp:approve"),
+    _hashArgs2(spender, value as Bytes<32>),
+    pubkeys,
+    signatures
+  );
   return owner;
 }
 
@@ -117,9 +165,20 @@ export circuit approve(spender: Bytes<32>, value: Uint<128>): Bytes<32> {
  * @description Redeems (burns) the caller's own balance. Blocks a frozen
  * caller on the returned id.
  */
-export circuit burn(value: Uint<128>): Bytes<32> {
+export circuit burn(
+  value: Uint<128>,
+  pubkeys: Vector<2, Bytes<64>>,
+  signatures: Vector<2, Bytes<64>>
+): Bytes<32> {
   const burner = CFT__burn(value);
   Compliance_assertNotFrozen(burner);
+  Custody_assertApproval(
+    burner,
+    pad(32, "xgbp:burn"),
+    _hashArgs1(value as Bytes<32>),
+    pubkeys,
+    signatures
+  );
   return burner;
 }
 
@@ -127,41 +186,105 @@ export circuit burn(value: Uint<128>): Bytes<32> {
  * @description Burns from `fromAddress`'s escrow (caller must be pre-approved).
  * The escrow itself is the authorization; freeze checks still apply.
  */
-export circuit burnFrom(fromAddress: Bytes<32>, value: Uint<128>): Bytes<32> {
+export circuit burnFrom(
+  fromAddress: Bytes<32>,
+  value: Uint<128>,
+  pubkeys: Vector<2, Bytes<64>>,
+  signatures: Vector<2, Bytes<64>>
+): Bytes<32> {
   Compliance_assertNotFrozen(fromAddress);
   const spender = CFT__burnFrom(fromAddress, value);
   Compliance_assertNotFrozen(spender);
+  Custody_assertApproval(
+    fromAddress,
+    pad(32, "xgbp:burnFrom"),
+    _hashArgs2(spender, value as Bytes<32>),
+    pubkeys,
+    signatures
+  );
   return spender;
 }
 
 // ---------------------------------------------------------------------------
-// Issuer operations (Ownable-gated)
+// Issuer operations (custody-gated)
 // ---------------------------------------------------------------------------
 
 /** @description Mints `value` to `account`. Issuer-only; recipient not frozen. */
-export circuit mint(account: Bytes<32>, value: Uint<128>): [] {
-  Ownable_assertOnlyOwner();
+export circuit mint(
+  account: Bytes<32>,
+  value: Uint<128>,
+  pubkeys: Vector<2, Bytes<64>>,
+  signatures: Vector<2, Bytes<64>>
+): [] {
+  Custody_assertApproval(
+    Custody_issuer(),
+    pad(32, "xgbp:mint"),
+    _hashArgs2(account, value as Bytes<32>),
+    pubkeys,
+    signatures
+  );
   Compliance_assertNotFrozen(account);
   CFT__mint(account, value);
 }
 
-export circuit freeze(account: Bytes<32>): [] {
-  Ownable_assertOnlyOwner();
+export circuit freeze(
+  account: Bytes<32>,
+  pubkeys: Vector<2, Bytes<64>>,
+  signatures: Vector<2, Bytes<64>>
+): [] {
+  Custody_assertApproval(
+    Custody_issuer(),
+    pad(32, "xgbp:freeze"),
+    _hashArgs1(account),
+    pubkeys,
+    signatures
+  );
   Compliance__freeze(account);
 }
 
-export circuit unfreeze(account: Bytes<32>): [] {
-  Ownable_assertOnlyOwner();
+export circuit unfreeze(
+  account: Bytes<32>,
+  pubkeys: Vector<2, Bytes<64>>,
+  signatures: Vector<2, Bytes<64>>
+): [] {
+  Custody_assertApproval(
+    Custody_issuer(),
+    pad(32, "xgbp:unfreeze"),
+    _hashArgs1(account),
+    pubkeys,
+    signatures
+  );
   Compliance__unfreeze(account);
 }
 
-export circuit setKycRequired(required: Boolean): [] {
-  Ownable_assertOnlyOwner();
+export circuit setKycRequired(
+  required: Boolean,
+  pubkeys: Vector<2, Bytes<64>>,
+  signatures: Vector<2, Bytes<64>>
+): [] {
+  Custody_assertApproval(
+    Custody_issuer(),
+    pad(32, "xgbp:setKycRequired"),
+    _hashArgs1(_boolArg(required)),
+    pubkeys,
+    signatures
+  );
   Compliance__setKycRequired(required);
 }
 
-export circuit setKycApproved(account: Bytes<32>, approved: Boolean): [] {
-  Ownable_assertOnlyOwner();
+export circuit setKycApproved(
+  account: Bytes<32>,
+  approved: Boolean,
+  pubkeys: Vector<2, Bytes<64>>,
+  signatures: Vector<2, Bytes<64>>
+): [] {
+  Custody_assertApproval(
+    Custody_issuer(),
+    pad(32, "xgbp:setKycApproved"),
+    _hashArgs2(account, _boolArg(approved)),
+    pubkeys,
+    signatures
+  );
   Compliance__setKycApproved(account, approved);
 }
 
@@ -189,6 +312,29 @@ export circuit isKycApproved(account: Bytes<32>): Boolean {
   return Compliance_isKycApproved(account);
 }
 
-export circuit owner(): Either<Bytes<32>, ContractAddress> {
-  return Ownable_owner();
+export circuit custodyNonce(): Uint<64> {
+  return Custody_getNonce();
+}
+
+export circuit custodyThreshold(): Uint<8> {
+  return Custody_getThreshold();
+}
+
+export circuit custodySignerCount(account: Bytes<32>): Uint<8> {
+  return Custody_getSignerCount(account);
+}
+
+export circuit isCustodyRegistered(account: Bytes<32>): Boolean {
+  return Custody_isCustodyRegistered(account);
+}
+
+export circuit isCustodySigner(account: Bytes<32>, commitment: Bytes<32>): Boolean {
+  return Custody_isSigner(account, commitment);
+}
+
+export pure circuit calculateCustodySignerId(
+  pk: Bytes<64>,
+  salt: Bytes<32>
+): Bytes<32> {
+  return Custody_calculateSignerId(pk, salt);
 }

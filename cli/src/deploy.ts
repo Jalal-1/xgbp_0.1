@@ -17,7 +17,15 @@ import {
   signData,
 } from '@midnight-ntwrk/ledger-v8';
 import { exitResultOrError, makeContractExecutableRuntime, SucceedEntirely, type FinalizedTxData } from '@midnight-ntwrk/midnight-js-types';
-import { XGBP, createXgbpPrivateState, createXgbpWitnesses, initialOwnerAccountId, type XgbpPrivateState } from '@xgbp/xgbp-contract';
+import {
+  XGBP,
+  createXgbpPrivateState,
+  createXgbpWitnesses,
+  custodyInstanceSalt,
+  initialIssuerAccountId,
+  custodySignerCommitmentsForActor,
+  type XgbpPrivateState,
+} from '@xgbp/xgbp-contract';
 import { artifactPath } from './providers.js';
 import { XgbpPrivateStateId, type DeployedXgbpContract, type XgbpCircuitId, type XgbpProviders } from './types.js';
 import type { WalletContext } from './wallet.js';
@@ -77,7 +85,7 @@ const saveDeployment = async (
   );
 };
 
-const deployWithoutVerifierKeys = async (
+const submitDeployTransaction = async (
   providers: XgbpProviders,
   walletContext: WalletContext,
   initialPrivateState: XgbpPrivateState,
@@ -90,27 +98,33 @@ const deployWithoutVerifierKeys = async (
     signingKey,
   });
 
-  await report(options, 'Running XGBP constructor locally: token metadata, issuer owner, initial ledger state...');
+  await report(options, 'Running XGBP constructor locally: token metadata, issuer custody, initial ledger state...');
+  const issuerSignerCommitments = custodySignerCommitmentsForActor(initialPrivateState, 'issuer');
   const exitResult = await contractRuntime.runPromiseExit(
     (contractExec as any).initialize(
       initialPrivateState,
       options.name,
       options.symbol,
       options.decimals,
-      initialOwnerAccountId(initialPrivateState),
+      initialIssuerAccountId(initialPrivateState),
+      custodyInstanceSalt(initialPrivateState),
+      issuerSignerCommitments[0],
+      issuerSignerCommitments[1],
+      issuerSignerCommitments[2],
     ),
   );
   const initResult = exitResultOrError(exitResult as any) as any;
 
   // The full constructor state includes all verifier keys. For this CFT that
-  // can exceed standalone block limits, so the first deploy keeps data +
-  // maintenance authority only. Verifier keys are inserted afterward.
+  // can exceed standalone block limits, so the deploy transaction carries the
+  // contract data and maintenance authority first. Verifier keys are inserted
+  // afterward.
   const fullState = LedgerContractState.deserialize(initResult.public.contractState.serialize());
-  const strippedState = new LedgerContractState();
-  strippedState.data = fullState.data;
-  strippedState.maintenanceAuthority = fullState.maintenanceAuthority;
+  const deployState = new LedgerContractState();
+  deployState.data = fullState.data;
+  deployState.maintenanceAuthority = fullState.maintenanceAuthority;
 
-  const contractDeploy = new ContractDeploy(strippedState);
+  const contractDeploy = new ContractDeploy(deployState);
   const contractAddress = contractDeploy.address as unknown as ContractAddress;
   const unprovenTx = Transaction.fromParts(
     getNetworkId(),
@@ -119,8 +133,8 @@ const deployWithoutVerifierKeys = async (
     Intent.new(ttl()).addDeploy(contractDeploy),
   );
 
-  await report(options, 'Preparing stripped deploy: contract data now, verifier keys in chunks afterward...');
-  await report(options, 'Balancing stripped deploy with wallet fees and DUST...');
+  await report(options, 'Preparing deploy transaction: contract data now, verifier keys afterward...');
+  await report(options, 'Balancing deploy transaction with wallet fees and DUST...');
   const recipe = await walletContext.wallet.balanceUnprovenTransaction(
     unprovenTx as any,
     {
@@ -129,26 +143,26 @@ const deployWithoutVerifierKeys = async (
     },
     { ttl: ttl() },
   );
-  await report(options, 'Signing stripped deploy transaction...');
+  await report(options, 'Signing deploy transaction...');
   const signedRecipe = await walletContext.wallet.signRecipe(recipe, (payload) =>
     walletContext.unshieldedKeystore.signData(payload),
   );
-  await report(options, 'Finalizing stripped deploy transaction...');
+  await report(options, 'Finalizing deploy transaction...');
   const finalizedTx = await walletContext.wallet.finalizeRecipe(signedRecipe);
-  await report(options, 'Submitting stripped deploy to local node...');
+  await report(options, 'Submitting deploy transaction to local node...');
   const txId = await walletContext.wallet.submitTransaction(finalizedTx);
-  await report(options, 'Waiting for stripped deploy finality from indexer...');
+  await report(options, 'Waiting for deploy finality from indexer...');
   const txData = await providers.publicDataProvider.watchForTxData(txId as any);
 
   if (txData.status !== SucceedEntirely) {
-    throw new Error(`Stripped deploy failed with status ${txData.status}`);
+    throw new Error(`Deploy failed with status ${txData.status}`);
   }
 
   providers.privateStateProvider.setContractAddress(contractAddress);
   await providers.privateStateProvider.set(XgbpPrivateStateId, initResult.private.privateState);
   await providers.privateStateProvider.setSigningKey(contractAddress, initResult.private.signingKey);
 
-  await report(options, `Stripped deploy finalized: ${contractAddress}`, txData);
+  await report(options, `Deploy finalized: ${contractAddress}`, txData);
   return contractAddress;
 };
 
@@ -261,7 +275,7 @@ export const deployXgbp = async (
   options: DeployOptions,
 ): Promise<DeployedXgbpContract> => {
   const initialPrivateState = createXgbpPrivateState();
-  const contractAddress = await deployWithoutVerifierKeys(providers, walletContext, initialPrivateState, options);
+  const contractAddress = await submitDeployTransaction(providers, walletContext, initialPrivateState, options);
 
   await publishVerifierKeysAdaptive(providers, contractAddress, options);
   await report(options, 'Binding CLI session to deployed XGBP contract...');

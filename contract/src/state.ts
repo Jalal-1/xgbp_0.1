@@ -1,16 +1,26 @@
 import { Buffer } from 'node:buffer';
 import { randomBytes } from 'node:crypto';
 import { CompactTypeBytes, CompactTypeVector, persistentHash, type WitnessContext } from '@midnight-ntwrk/compact-runtime';
+import * as XGBP from './artifacts/XGBP/contract/index.js';
 import type { ElGamal_Ciphertext, Ledger, Witnesses } from './artifacts/XGBP/contract/index.js';
 
 export const actorNames = ['issuer', 'alice', 'bob'] as const;
 export type ActorName = (typeof actorNames)[number];
+export type CustodySignerLabel = 'user' | 'backup' | 'custodian';
+
+export type CustodySigner = {
+  label: CustodySignerLabel;
+  publicKey: Uint8Array;
+  signature: Uint8Array;
+  commitment: Uint8Array;
+};
 
 export type LocalActor = {
   label: ActorName;
   secretKey: Uint8Array;
   encryptionKey: Uint8Array;
   accountId: Uint8Array;
+  custodySigners: CustodySigner[];
   knownBalance: bigint;
   registered: boolean;
   kycApproved: boolean;
@@ -22,7 +32,7 @@ export type XgbpPrivateState = {
   activeActor: ActorName;
   secretKey: Uint8Array;
   encryptionKey: Uint8Array;
-  ownerSecretKey: Uint8Array;
+  custodyInstanceSalt: Uint8Array;
   randomnessSeed: Uint8Array;
   kycRequired: boolean;
   totalSupply: bigint;
@@ -33,9 +43,12 @@ export type XgbpPrivateState = {
 const bytes32Type = new CompactTypeVector(1, new CompactTypeBytes(32));
 const encoder = new TextEncoder();
 
-const deterministicKey = (label: string): Uint8Array => {
-  const key = new Uint8Array(32);
-  key.set(encoder.encode(label).slice(0, 32));
+const deterministicBytes = (label: string, length: number): Uint8Array => {
+  const source = encoder.encode(label);
+  const key = new Uint8Array(length);
+  for (let i = 0; i < length; i += 1) {
+    key[i] = source[i % source.length] ^ ((i * 31) & 0xff);
+  }
   return key;
 };
 
@@ -47,15 +60,27 @@ const randomSeed = (): Uint8Array => new Uint8Array(randomBytes(32));
 
 const buildAccountId = (secretKey: Uint8Array): Uint8Array => persistentHash(bytes32Type, [secretKey]);
 
-const createActor = (label: ActorName, keyPrefix: string): LocalActor => {
-  const secretKey = deterministicKey(`${keyPrefix}_SK`);
-  const encryptionKey = deterministicKey(`${keyPrefix}_EK`);
+const createCustodySigners = (keyPrefix: string, instanceSalt: Uint8Array): CustodySigner[] =>
+  (['user', 'backup', 'custodian'] as const).map((label) => {
+    const publicKey = deterministicBytes(`${keyPrefix}_CUSTODY_${label.toUpperCase()}_PK`, 64);
+    return {
+      label,
+      publicKey,
+      signature: deterministicBytes(`${keyPrefix}_CUSTODY_${label.toUpperCase()}_SIG`, 64),
+      commitment: XGBP.pureCircuits.calculateCustodySignerId(publicKey, instanceSalt),
+    };
+  });
+
+const createActor = (label: ActorName, keyPrefix: string, instanceSalt: Uint8Array): LocalActor => {
+  const secretKey = deterministicBytes(`${keyPrefix}_SK`, 32);
+  const encryptionKey = deterministicBytes(`${keyPrefix}_EK`, 32);
 
   return {
     label,
     secretKey,
     encryptionKey,
     accountId: buildAccountId(secretKey),
+    custodySigners: createCustodySigners(keyPrefix, instanceSalt),
     knownBalance: 0n,
     registered: false,
     kycApproved: false,
@@ -65,15 +90,16 @@ const createActor = (label: ActorName, keyPrefix: string): LocalActor => {
 };
 
 export const createXgbpPrivateState = (): XgbpPrivateState => {
-  const issuer = createActor('issuer', 'XGBP_ISSUER');
-  const alice = createActor('alice', 'XGBP_ALICE');
-  const bob = createActor('bob', 'XGBP_BOB');
+  const custodyInstanceSalt = deterministicBytes('XGBP_CUSTODY_INSTANCE_SALT', 32);
+  const issuer = createActor('issuer', 'XGBP_ISSUER', custodyInstanceSalt);
+  const alice = createActor('alice', 'XGBP_ALICE', custodyInstanceSalt);
+  const bob = createActor('bob', 'XGBP_BOB', custodyInstanceSalt);
 
   return {
     activeActor: 'issuer',
     secretKey: issuer.secretKey,
     encryptionKey: issuer.encryptionKey,
-    ownerSecretKey: issuer.secretKey,
+    custodyInstanceSalt,
     randomnessSeed: randomSeed(),
     kycRequired: false,
     totalSupply: 0n,
@@ -83,15 +109,39 @@ export const createXgbpPrivateState = (): XgbpPrivateState => {
 };
 
 export const normalizeXgbpPrivateState = (state: XgbpPrivateState): XgbpPrivateState => {
-  if (state.actors !== undefined && state.activeActor !== undefined) {
+  if (
+    state.actors !== undefined &&
+    state.activeActor !== undefined &&
+    state.custodyInstanceSalt !== undefined &&
+    state.actors.issuer.custodySigners !== undefined
+  ) {
     return state;
   }
 
   return createXgbpPrivateState();
 };
 
-export const initialOwnerAccountId = (state: XgbpPrivateState): Uint8Array =>
+export const initialIssuerAccountId = (state: XgbpPrivateState): Uint8Array =>
   normalizeXgbpPrivateState(state).actors.issuer.accountId;
+
+export const custodyInstanceSalt = (state: XgbpPrivateState): Uint8Array =>
+  normalizeXgbpPrivateState(state).custodyInstanceSalt;
+
+export const custodySignerCommitmentsForActor = (state: XgbpPrivateState, actor: ActorName): Uint8Array[] =>
+  normalizeXgbpPrivateState(state).actors[actor].custodySigners.map((signer) => signer.commitment);
+
+export const custodyApprovalForActor = (
+  state: XgbpPrivateState,
+  actor: ActorName,
+): { pubkeys: Uint8Array[]; signatures: Uint8Array[]; labels: CustodySignerLabel[] } => {
+  const signers = normalizeXgbpPrivateState(state).actors[actor].custodySigners;
+  const selected = [signers[0], signers[2]];
+  return {
+    pubkeys: selected.map((signer) => signer.publicKey),
+    signatures: selected.map((signer) => signer.signature),
+    labels: selected.map((signer) => signer.label),
+  };
+};
 
 const serializeCiphertext = (ct: ElGamal_Ciphertext): string =>
   `${ct.c1.x.toString(16)}:${ct.c1.y.toString(16)}:${ct.c2.x.toString(16)}:${ct.c2.y.toString(16)}`;
@@ -233,9 +283,5 @@ export const createXgbpWitnesses = (): Witnesses<XgbpPrivateState> => ({
     context: WitnessContext<Ledger, XgbpPrivateState>,
   ): [XgbpPrivateState, Uint8Array] {
     return [context.privateState, normalizeXgbpPrivateState(context.privateState).randomnessSeed];
-  },
-
-  wit_OwnableSK(context: WitnessContext<Ledger, XgbpPrivateState>): [XgbpPrivateState, Uint8Array] {
-    return [context.privateState, normalizeXgbpPrivateState(context.privateState).ownerSecretKey];
   },
 });
